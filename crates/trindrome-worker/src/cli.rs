@@ -9,10 +9,13 @@ use clap::{Parser, Subcommand};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use trindrome_core::SearchSpace;
+use trindrome_core::filter::PRODUCTION_WINDOW;
 use trindrome_cpu::search_range;
+use trindrome_cuda::{CudaBackend, Prepared};
 use trindrome_worker::configuration::{Backend, Config};
+use trindrome_worker::engine::{CPU_BACKEND, Engine, cpu_hardware};
 use trindrome_worker::persistence::{Family, Requested, Store, now_ms};
-use trindrome_worker::scheduler::{self, CPU_BACKEND};
+use trindrome_worker::scheduler;
 
 #[derive(Parser)]
 #[command(
@@ -113,20 +116,32 @@ pub fn main() -> Result<ExitCode> {
 }
 
 fn run(config: &Config, now: bool, cpu: bool, threads: Option<usize>) -> Result<ExitCode> {
-    match (cpu, config.compute.backend) {
-        (true, _) | (false, Backend::Cpu) => {}
-        (false, backend) => bail!(
-            "the CUDA backend is not available yet, and compute.backend = {backend:?} never falls back to the CPU \
-             silently. Pass --cpu or set compute.backend = \"cpu\"."
-        ),
-    }
     if !now && config.idle.enabled {
         bail!(
             "idle detection is not implemented yet, so automatic mode cannot start safely. \
              Use `trindrome run --now` to start immediately."
         );
     }
-    let threads = threads.unwrap_or(config.compute.effective_cpu_threads()).max(1);
+    let engines = if cpu || config.compute.backend == Backend::Cpu {
+        let threads = threads.unwrap_or(config.compute.effective_cpu_threads()).max(1);
+        (0..threads).map(|_| Engine::cpu()).collect()
+    } else {
+        // `auto` and `cuda` both require the GPU: never fall back to the CPU silently.
+        match Engine::cuda(&config.compute) {
+            Ok(engine) => {
+                eprintln!(
+                    "note: GPU temperature limits are not enforced yet (Phase 4); the GPU's own thermal \
+                     protection still applies"
+                );
+                vec![engine]
+            }
+            Err(e) => bail!(
+                "the CUDA backend is unavailable ({e}). compute.backend = {:?} never falls back to the CPU \
+                 silently; pass --cpu to search on the CPU instead.",
+                config.compute.backend
+            ),
+        }
+    };
 
     let interrupted = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&interrupted);
@@ -138,7 +153,7 @@ fn run(config: &Config, now: bool, cpu: bool, threads: Option<usize>) -> Result<
         eprintln!("stopping after the current batch (Ctrl+C again to exit immediately)");
     })?;
 
-    let reason = scheduler::run(config, threads, &interrupted)?;
+    let reason = scheduler::run(config, engines, &interrupted)?;
     println!("worker stopped: {reason}");
     let found = Store::open(&config.storage.database_path)?
         .discoveries()?
@@ -191,7 +206,9 @@ fn status(config: &Config) -> Result<ExitCode> {
     if let Some(e) = &worker.last_error {
         println!("Last error:  {e}");
     }
-    println!("Backend:     {CPU_BACKEND} on {}", scheduler::hardware_id());
+    if let Some((backend, hardware)) = store.last_backend()? {
+        println!("Backend:     {backend} on {hardware}");
+    }
 
     let totals = store.totals()?;
     let window = Duration::from_secs((2 * config.compute.checkpoint_interval_seconds).max(60));
@@ -282,7 +299,18 @@ fn coverage(store: &Store, all: bool) -> Result<ExitCode> {
             c.intervals.len()
         );
     }
-    println!("All coverage so far is from the exact CPU reference backend.");
+    println!();
+    println!("Searched by backend:");
+    for (backend, candidates) in store.coverage_by_backend()? {
+        let note = if backend.contains("cuda") {
+            "GPU exact filter; survivors verified on the CPU"
+        } else {
+            "exact CPU reference"
+        };
+        println!("  {backend:<32} {candidates:>22}  ({note})");
+    }
+    let (audits, audited) = store.audit_summary()?;
+    println!("GPU audits:  {audits} slices, {audited} candidates recomputed on the CPU, all checksums matched");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -323,8 +351,13 @@ fn benchmark(seconds: u64, threads: usize) -> Result<ExitCode> {
         (33, 0x5, "frontier B"),
     ];
     let per_case = Duration::from_secs(seconds.max(cases.len() as u64)) / cases.len() as u32;
+    match CudaBackend::new(0) {
+        Ok(gpu) => benchmark_gpu(gpu, per_case)?,
+        Err(e) => println!("GPU: unavailable ({e})"),
+    }
     println!(
-        "{CPU_BACKEND}, {threads} threads, {:.1}s per case",
+        "{CPU_BACKEND} on {}, {threads} threads, {:.1}s per case",
+        cpu_hardware(),
         per_case.as_secs_f64()
     );
     for (n, lead, label) in cases {
@@ -361,6 +394,52 @@ fn benchmark(seconds: u64, threads: usize) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// GPU filter throughput, including survivor transfer but not CPU verification.
+fn benchmark_gpu(mut gpu: CudaBackend, per_case: Duration) -> Result<()> {
+    let cases = [
+        (32u32, 0x9u8, "historical 9-family"),
+        (64, 0x1, "historical 1-family"),
+        (65, 0x1, "frontier A"),
+        (33, 0x5, "frontier B"),
+        (128, 0x3, "512-bit limit"),
+    ];
+    println!(
+        "{} on gpu:{}, {:.1}s per case",
+        trindrome_cuda::IMPLEMENTATION,
+        gpu.device_name(),
+        per_case.as_secs_f64()
+    );
+    for (n, lead, label) in cases {
+        let space = SearchSpace::new(n, lead)?;
+        let prepared = Prepared::new(space, PRODUCTION_WINDOW)?;
+        let total = space.candidate_count().to_u64().unwrap_or(u64::MAX);
+        let batch = (1u64 << 30).min(total / 4);
+        let (mut start, mut done, mut survivors) = (total / 4, 0u64, 0usize);
+        let mut busy = Duration::ZERO;
+        let began = Instant::now();
+        while began.elapsed() < per_case {
+            if start + batch > total {
+                start = 0;
+            }
+            let r = gpu.search(&prepared, start, batch)?;
+            if r.processed != batch {
+                bail!("GPU processed {} of {batch} candidates", r.processed);
+            }
+            busy += r.elapsed;
+            done += batch;
+            survivors += r.survivors.len();
+            start += batch;
+        }
+        println!(
+            "  {label:<20} {n:>3} hex digits ({:>2}-limb kernel): {:>8}/s, {survivors} survivors in {}",
+            prepared.limbs,
+            human(done as f64 / busy.as_secs_f64()),
+            human(done as f64)
+        );
+    }
+    Ok(())
 }
 
 fn to_f64(v: &BigUint) -> f64 {

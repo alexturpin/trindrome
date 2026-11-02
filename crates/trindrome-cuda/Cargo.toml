@@ -1,0 +1,15 @@
+[package]
+name = "trindrome-cuda"
+description = "CUDA search backend for Trindrome: an exact GPU rejection filter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+trindrome-core.workspace = true
+cudarc.workspace = true
+num-bigint.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+cc.workspace = true

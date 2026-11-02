@@ -3,7 +3,8 @@
 ```text
 trindrome-core     generator, palindrome checks, verification, WorkChunk   (no platform deps)
 trindrome-cpu      exact reference search over an index range               (depends on core)
-trindrome-worker   trindrome.exe: config, SQLite store, scheduler, CLI      (depends on both)
+trindrome-cuda     GPU exact rejection filter, kernels + cudarc host side   (depends on core)
+trindrome-worker   trindrome.exe: config, SQLite store, engines, scheduler, CLI
 ```
 
 The mathematics knows nothing about scheduling, and scheduling knows nothing about Windows yet. Idle detection, GPU telemetry and power handling arrive in Phase 4, as a separate resource policy that only decides *whether* to run.
@@ -18,6 +19,7 @@ A single SQLite database, in WAL mode with `synchronous = FULL`.
 | `work_chunks` | Allocated ranges `[start_index, end_index)` with a committed cursor `next_index`, state (`pending`, `running` or `complete`), attempts, backend and active time. |
 | `discoveries` | Every verified match (trivial ones too, flagged), keyed by decimal value. |
 | `performance_samples` | One row per checkpoint: hardware, backend, integer width, candidates and active time. |
+| `audits` | GPU/CPU checksum comparisons of random slices of GPU batches (only matched ones are recorded; a mismatch stops the worker). |
 | `worker_state` | The requested state (`run`, `pause` or `stop`, set by the CLI), the observed state, a heartbeat and the last error. |
 
 Indices are stored as canonical decimal strings, the same encoding the work units use.
@@ -46,6 +48,18 @@ Commits happen when a batch produced a match, when a chunk finishes, when pausin
 - **Batches** are sized from the measured rate to about `batch_target_ms`. They shrink immediately when one runs long, and grow to at most twice what was actually searched, so a batch cut short at a chunk boundary cannot inflate the size and with it the pause latency.
 - **Pause, resume and stop.** The CLI writes `worker_state.requested`, and the main thread polls it every 250 ms. On pause or stop, each search thread finishes its current batch, commits, and releases its chunk back to `pending`. A pause persists across restarts; a stop is one-shot. Ctrl+C acts as a stop, and a second Ctrl+C exits immediately, which is safe because of the checkpoint rule.
 
-## Backend policy
+## Engines and backend policy (`engine.rs`)
 
-`compute.backend = "auto"` must never silently switch to intensive CPU execution. Until the CUDA backend exists, `trindrome run` therefore requires `--cpu` or `backend = "cpu"`. Likewise, with idle detection not yet implemented, automatic mode refuses to start: run with `--now`, or set `idle.enabled = false`.
+Each search thread owns one engine, which turns a batch `[start, end)` into CPU-verified matches.
+
+- **CPU engine:** the exact reference, one per CPU thread.
+- **CUDA engine:** one thread. It launches the filter kernel, then:
+  - requires the kernel's processed count to equal the batch size;
+  - rebuilds every survivor from its index and checks it exactly on the CPU;
+  - if the survivor buffer overflowed, searches the whole batch again on the CPU;
+  - every `audit_every_batches` batches, recomputes a random slice on the GPU and with the Rust reference filter. A checksum mismatch fails the batch before anything is committed.
+- **Short spaces on a GPU worker.** Spaces too short for the filter (about 15 hex digits or fewer, roughly 4M candidates in all) are searched inline by the CPU reference.
+
+Matched audits are stored in `audits` within the same checkpoint transaction. `work_chunks.backend` lists every backend that contributed to a chunk, and `trindrome coverage` reports searched candidates by backend. This keeps GPU-searched coverage distinguishable from CPU-reference coverage, as the addendum requires.
+
+`compute.backend = "auto"` (or `"cuda"`) never silently switches to intensive CPU execution: if CUDA is unavailable, `run` reports why and suggests `--cpu`. With idle detection not yet implemented, automatic mode refuses to start; run with `--now`, or set `idle.enabled = false`. GPU temperature limits arrive with NVML in Phase 4, and until then only the GPU's own thermal protection applies.

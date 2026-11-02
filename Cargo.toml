@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/trindrome-core", "crates/trindrome-cpu", "crates/trindrome-worker"]
+members = ["crates/trindrome-core", "crates/trindrome-cpu", "crates/trindrome-cuda", "crates/trindrome-worker"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,7 +10,12 @@ rust-version = "1.89"
 [workspace.dependencies]
 trindrome-core = { path = "crates/trindrome-core" }
 trindrome-cpu = { path = "crates/trindrome-cpu" }
+trindrome-cuda = { path = "crates/trindrome-cuda" }
 anyhow = "1"
+cc = "1.2"
+# Driver API only, loaded at run time so the binary works on machines without CUDA.
+# `nvrtc` is needed only for cudarc's module-image type; NVRTC itself is never loaded.
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.5"
 num-bigint = "0.5"

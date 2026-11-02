@@ -5,6 +5,7 @@ use num_bigint::BigUint;
 use trindrome_core::{SearchSpace, Verification};
 use trindrome_cpu::{Match, search_range};
 use trindrome_worker::configuration::{Config, Search, SearchMode};
+use trindrome_worker::engine::Engine;
 use trindrome_worker::persistence::{Checkpoint, Claim, Family, Store};
 use trindrome_worker::scheduler;
 
@@ -35,6 +36,7 @@ fn finish(store: &mut Store, claim: &Claim) -> bool {
             from: &claim.next_index,
             to: &claim.chunk.end_index,
             matches: &result.matches,
+            audits: &[],
             candidates: result.candidates_checked,
             active: result.elapsed,
             hardware: "test",
@@ -76,7 +78,7 @@ fn frontier_opens_lengths_lazily_and_cheapest_first() {
     );
 
     // Both first frontier spaces hold 2^32 candidates; the shorter length goes first.
-    let claim = store.claim(&plan, 1 << 20, "test").unwrap().unwrap();
+    let claim = store.claim(&plan, 1 << 20).unwrap().unwrap();
     assert_eq!(claim.chunk.id(), "trindrome:g1:h33:5:0-1048576");
 }
 
@@ -88,7 +90,7 @@ fn claims_tile_spaces_and_complete_the_plan() {
     store.plan(&plan).unwrap();
 
     let mut claims = 0;
-    while let Some(claim) = store.claim(&plan, 7, "test").unwrap() {
+    while let Some(claim) = store.claim(&plan, 7).unwrap() {
         assert!(finish(&mut store, &claim));
         claims += 1;
     }
@@ -112,7 +114,7 @@ fn interrupted_chunks_resume_from_their_committed_cursor() {
     let (id, half) = {
         let mut store = open(&dir);
         store.plan(&plan).unwrap();
-        let claim = store.claim(&plan, 1000, "test").unwrap().unwrap();
+        let claim = store.claim(&plan, 1000).unwrap().unwrap();
         let half = &claim.next_index + 500u32;
         let space = claim.chunk.validate().unwrap();
         let r = search_range(space, &claim.next_index, &half).unwrap();
@@ -122,6 +124,7 @@ fn interrupted_chunks_resume_from_their_committed_cursor() {
                 from: &claim.next_index,
                 to: &half,
                 matches: &r.matches,
+                audits: &[],
                 candidates: r.candidates_checked,
                 active: r.elapsed,
                 hardware: "test",
@@ -134,7 +137,7 @@ fn interrupted_chunks_resume_from_their_committed_cursor() {
 
     let mut store = open(&dir);
     assert_eq!(store.recover_interrupted().unwrap(), 1);
-    let claim = store.claim(&plan, 1000, "test").unwrap().unwrap();
+    let claim = store.claim(&plan, 1000).unwrap().unwrap();
     assert_eq!(claim.chunk.id(), id);
     assert_eq!(claim.next_index, half);
     assert!(finish(&mut store, &claim));
@@ -147,7 +150,7 @@ fn checkpoints_cannot_overstate_progress() {
     let mut store = open(&dir);
     let plan = search(SearchMode::HistoricalReplay, 9, Some(9));
     store.plan(&plan).unwrap();
-    let claim = store.claim(&plan, 100, "test").unwrap().unwrap();
+    let claim = store.claim(&plan, 100).unwrap().unwrap();
     let id = claim.chunk.id();
     let attempt = |store: &mut Store, from: u64, to: u64, candidates: u64, matches: &[Match]| {
         store.checkpoint(&Checkpoint {
@@ -155,6 +158,7 @@ fn checkpoints_cannot_overstate_progress() {
             from: &big(from),
             to: &big(to),
             matches,
+            audits: &[],
             candidates,
             active: Duration::ZERO,
             hardware: "test",
@@ -198,7 +202,12 @@ fn worker_runs_a_small_plan_to_completion() {
     config.compute.chunk_candidates = 5000;
     config.compute.batch_target_ms = 5;
 
-    let reason = scheduler::run(&config, 3, &AtomicBool::new(false)).unwrap();
+    let reason = scheduler::run(
+        &config,
+        (0..3).map(|_| Engine::cpu()).collect(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(reason, "search plan exhausted");
 
     let store = Store::open(&config.storage.database_path).unwrap();

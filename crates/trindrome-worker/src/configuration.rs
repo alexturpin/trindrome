@@ -43,6 +43,10 @@ pub struct Compute {
     pub cpu_threads: usize,
     /// Size of each newly allocated work chunk.
     pub chunk_candidates: u64,
+    /// Audit one random slice of every Nth GPU batch against the CPU (0 disables).
+    pub audit_every_batches: u32,
+    /// Candidates per audit slice.
+    pub audit_candidates: u64,
 }
 
 impl Default for Compute {
@@ -54,6 +58,8 @@ impl Default for Compute {
             checkpoint_interval_seconds: 30,
             cpu_threads: 0,
             chunk_candidates: 1 << 30,
+            audit_every_batches: 25,
+            audit_candidates: 1 << 15,
         }
     }
 }
@@ -222,6 +228,9 @@ impl Config {
         }
         if c.chunk_candidates == 0 {
             bail!("compute.chunk_candidates must be positive");
+        }
+        if c.audit_candidates == 0 {
+            bail!("compute.audit_candidates must be positive");
         }
         let s = &self.search;
         if s.minimum_hex_digits == 0 {

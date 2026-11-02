@@ -16,6 +16,7 @@ use trindrome_core::{GENERATOR_VERSION, SearchSpace, Verification, WorkChunk};
 use trindrome_cpu::Match;
 
 use crate::configuration::Search;
+use crate::engine::Audit;
 
 pub const STORE_SCHEMA_VERSION: u32 = 1;
 
@@ -155,6 +156,17 @@ CREATE TABLE IF NOT EXISTS worker_state (
 ) STRICT;
 
 INSERT OR IGNORE INTO worker_state (id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS audits (
+    id INTEGER PRIMARY KEY,
+    chunk_id TEXT NOT NULL REFERENCES work_chunks (id),
+    start_index TEXT NOT NULL,
+    candidates INTEGER NOT NULL,
+    gpu_checksum TEXT NOT NULL,
+    cpu_checksum TEXT NOT NULL,
+    matched INTEGER NOT NULL,
+    recorded_at INTEGER NOT NULL
+) STRICT;
 "#;
 
 #[derive(Clone, Debug)]
@@ -191,6 +203,8 @@ pub struct Checkpoint<'a> {
     /// The new cursor: everything in `[from, to)` has been searched.
     pub to: &'a BigUint,
     pub matches: &'a [Match],
+    /// CPU/GPU checksum audits of slices of this progress, all matched.
+    pub audits: &'a [Audit],
     pub candidates: u64,
     pub active: Duration,
     pub hardware: &'a str,
@@ -308,7 +322,7 @@ impl Store {
 
     /// Atomically takes the next chunk to work on: a previously interrupted chunk if
     /// any, otherwise a fresh allocation from the highest-priority space.
-    pub fn claim(&mut self, search: &Search, chunk_candidates: u64, backend: &str) -> Result<Option<Claim>> {
+    pub fn claim(&mut self, search: &Search, chunk_candidates: u64) -> Result<Option<Claim>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_frontier(&tx, search)?;
         let spaces = load_spaces(&tx)?;
@@ -389,8 +403,8 @@ impl Store {
         };
 
         tx.execute(
-            "UPDATE work_chunks SET state = 'running', attempts = attempts + 1, backend = ?2, last_checkpoint_at = ?3 WHERE id = ?1",
-            params![claim.chunk.id(), backend, now_ms()],
+            "UPDATE work_chunks SET state = 'running', attempts = attempts + 1, last_checkpoint_at = ?2 WHERE id = ?1",
+            params![claim.chunk.id(), now_ms()],
         )?;
         tx.commit()?;
         Ok(Some(claim))
@@ -465,12 +479,37 @@ impl Store {
         let complete = *cp.to == end;
         let now = now_ms();
         let active_ms = cp.active.as_millis() as i64;
+        for a in cp.audits {
+            ensure!(a.matched(), "refusing to record a failed audit as progress");
+            ensure!(
+                BigUint::from(a.start) >= *cp.from && BigUint::from(a.start + a.count) <= *cp.to,
+                "audit outside progress"
+            );
+            tx.execute(
+                "INSERT INTO audits (chunk_id, start_index, candidates, gpu_checksum, cpu_checksum, matched, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                params![
+                    cp.chunk_id,
+                    a.start.to_string(),
+                    a.count as i64,
+                    format!("{:016x}", a.gpu_checksum),
+                    format!("{:016x}", a.cpu_checksum),
+                    now
+                ],
+            )?;
+        }
+        // A chunk lists every backend that contributed to it, e.g. "cpu-reference/0.1.0+cuda/0.1.0".
         tx.execute(
             "UPDATE work_chunks SET next_index = ?2, active_ms = active_ms + ?3, last_checkpoint_at = ?4,
                  state = CASE WHEN ?5 THEN 'complete' ELSE state END,
-                 completed_at = CASE WHEN ?5 THEN ?4 ELSE NULL END
+                 completed_at = CASE WHEN ?5 THEN ?4 ELSE NULL END,
+                 backend = CASE
+                     WHEN backend IS NULL OR backend = ?6 THEN ?6
+                     WHEN instr('+' || backend || '+', '+' || ?6 || '+') > 0 THEN backend
+                     ELSE backend || '+' || ?6
+                 END
              WHERE id = ?1",
-            params![cp.chunk_id, cp.to.to_string(), active_ms, now, complete],
+            params![cp.chunk_id, cp.to.to_string(), active_ms, now, complete, cp.backend],
         )?;
         tx.execute(
             "INSERT INTO performance_samples
@@ -655,6 +694,49 @@ impl Store {
                 })
             },
         )?)
+    }
+
+    /// Searched candidates grouped by the backend(s) that searched each chunk.
+    pub fn coverage_by_backend(&self) -> Result<Vec<(String, BigUint)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(backend, '(none)'), start_index, next_index FROM work_chunks WHERE generator_version = ?1",
+        )?;
+        let rows = stmt.query_map([GENERATOR_VERSION], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut totals: Vec<(String, BigUint)> = Vec::new();
+        for row in rows {
+            let (backend, start, next) = row?;
+            let covered = parse_big(&next)? - parse_big(&start)?;
+            match totals.iter_mut().find(|(b, _)| *b == backend) {
+                Some((_, sum)) => *sum += covered,
+                None => totals.push((backend, covered)),
+            }
+        }
+        totals.retain(|(_, n)| *n > BigUint::ZERO);
+        totals.sort();
+        Ok(totals)
+    }
+
+    /// (audits, candidates audited) — every recorded audit matched.
+    pub fn audit_summary(&self) -> Result<(u64, u64)> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(candidates), 0) FROM audits WHERE matched = 1",
+            [],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )?)
+    }
+
+    /// Backend and hardware of the most recent checkpoint.
+    pub fn last_backend(&self) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT backend, hardware FROM performance_samples ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
     }
 
     /// Candidates committed per second over the trailing `window`.

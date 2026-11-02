@@ -3,8 +3,9 @@
 # None of these settings can invalidate recorded coverage.
 
 [compute]
-# "auto" prefers CUDA and never silently falls back to the CPU. CUDA is not
-# implemented yet, so use "cpu" (or `trindrome run --cpu`) for now.
+# "auto" and "cuda" use the GPU and never silently fall back to the CPU (spaces
+# under about 15 hex digits, ~4M candidates in all, are always done on the CPU).
+# "cpu" (or `trindrome run --cpu`) uses the exact CPU reference.
 backend = "auto"
 gpu_device = 0
 # Target length of one uninterruptible batch; this bounds pause latency.
@@ -16,6 +17,10 @@ checkpoint_interval_seconds = 30
 cpu_threads = 0
 # Size of each newly allocated work chunk.
 chunk_candidates = 1073741824
+# Every Nth GPU batch, a random slice of it is recomputed on the CPU and the
+# checksums compared before the batch is committed (0 disables).
+audit_every_batches = 25
+audit_candidates = 32768
 
 # Not enforced yet (Phase 4). Because idle detection is missing, `trindrome run`
 # refuses to start unless you pass --now or set enabled = false.
@@ -27,7 +32,8 @@ gpu_idle_sample_seconds = 30
 require_ac_power = true
 exclusive_gpu_apps = []
 
-# Not enforced yet (Phase 4). These defaults are provisional: an RTX 3070 Laptop
+# Not enforced yet (Phase 4); until then only the GPU's own thermal protection
+# applies. These defaults are provisional: an RTX 3070 Laptop
 # GPU commonly runs at 80-87 °C under load, so measure before relying on them.
 [thermal]
 enabled = true

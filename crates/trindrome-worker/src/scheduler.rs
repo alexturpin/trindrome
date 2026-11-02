@@ -1,9 +1,9 @@
 //! The local worker: claims chunks, searches them in short batches and checkpoints.
 //!
-//! Each search thread holds its own database connection and claims chunks in
-//! `BEGIN IMMEDIATE` transactions, so threads coordinate through SQLite exactly as
-//! independent processes (or, later, machines) would. The main thread only relays
-//! control requests and writes heartbeats.
+//! Each search thread owns one [`Engine`] and its own database connection and
+//! claims chunks in `BEGIN IMMEDIATE` transactions, so threads coordinate through
+//! SQLite exactly as independent processes (or, later, machines) would. The main
+//! thread only relays control requests and writes heartbeats.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
@@ -16,14 +16,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use tracing::{debug, info, warn};
-use trindrome_cpu::{Match, search_range};
+use trindrome_cpu::Match;
 
 use crate::configuration::{Config, Search};
+use crate::engine::{Audit, Engine};
 use crate::persistence::{Checkpoint, Claim, Requested, Store};
 
-pub const CPU_BACKEND: &str = trindrome_cpu::IMPLEMENTATION;
-
-const INITIAL_BATCH: u64 = 1 << 12;
 const CONTROL_POLL: Duration = Duration::from_millis(250);
 
 /// Exclusive ownership of a database by one worker process.
@@ -63,11 +61,6 @@ pub fn worker_is_running(database: &Path) -> bool {
         return false;
     };
     matches!(file.try_lock(), Err(TryLockError::WouldBlock))
-}
-
-pub fn hardware_id() -> String {
-    let cpu = std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| std::env::consts::ARCH.to_string());
-    format!("cpu:{cpu}")
 }
 
 const RUN: u8 = 0;
@@ -118,20 +111,20 @@ struct WorkerContext {
     chunk_candidates: u64,
     batch_target: Duration,
     checkpoint_interval: Duration,
-    hardware: String,
     control: Control,
 }
 
-/// Runs the CPU search until the plan is exhausted, a stop is requested, or
-/// `interrupted` becomes true. Returns the reason it stopped.
-pub fn run(config: &Config, threads: usize, interrupted: &AtomicBool) -> Result<String> {
+/// Runs one search thread per engine until the plan is exhausted, a stop is
+/// requested, or `interrupted` becomes true. Returns the reason it stopped.
+pub fn run(config: &Config, engines: Vec<Engine>, interrupted: &AtomicBool) -> Result<String> {
     let database = config.storage.database_path.clone();
     let _lock = acquire_lock(&database)?;
     let mut store = Store::open(&database)?;
     let added = store.plan(&config.search)?;
     let recovered = store.recover_interrupted()?;
     store.worker_started()?;
-    info!(database = %database.display(), threads, added_spaces = added, recovered_chunks = recovered, backend = CPU_BACKEND, "worker starting");
+    let hardware = engines.first().map(Engine::hardware).unwrap_or_default();
+    info!(database = %database.display(), threads = engines.len(), %hardware, added_spaces = added, recovered_chunks = recovered, "worker starting");
 
     let ctx = Arc::new(WorkerContext {
         database,
@@ -139,15 +132,14 @@ pub fn run(config: &Config, threads: usize, interrupted: &AtomicBool) -> Result<
         chunk_candidates: config.compute.chunk_candidates,
         batch_target: Duration::from_millis(config.compute.batch_target_ms),
         checkpoint_interval: Duration::from_secs(config.compute.checkpoint_interval_seconds),
-        hardware: hardware_id(),
         control: Control::default(),
     });
 
-    let mut handles = Vec::with_capacity(threads);
-    for i in 0..threads {
+    let mut handles = Vec::with_capacity(engines.len());
+    for (i, engine) in engines.into_iter().enumerate() {
         let thread_ctx = Arc::clone(&ctx);
         let handle = thread::Builder::new().name(format!("search-{i}")).spawn(move || {
-            let result = search_thread(&thread_ctx);
+            let result = search_thread(&thread_ctx, engine);
             if let Err(e) = &result {
                 thread_ctx.control.stop(format!("error: {e:#}"));
             }
@@ -228,14 +220,15 @@ fn monitor(
     Ok(())
 }
 
-fn search_thread(ctx: &WorkerContext) -> Result<()> {
+fn search_thread(ctx: &WorkerContext, mut engine: Engine) -> Result<()> {
     let mut store = Store::open(&ctx.database)?;
-    let mut batch = INITIAL_BATCH;
+    let hardware = engine.hardware();
+    let mut batch = engine.initial_batch();
     while ctx.control.wait_until_runnable() {
-        let Some(claim) = store.claim(&ctx.search, ctx.chunk_candidates, CPU_BACKEND)? else {
+        let Some(claim) = store.claim(&ctx.search, ctx.chunk_candidates)? else {
             return Ok(());
         };
-        search_claim(ctx, &mut store, claim, &mut batch)?;
+        search_claim(ctx, &mut store, &mut engine, &hardware, claim, &mut batch)?;
     }
     Ok(())
 }
@@ -246,12 +239,14 @@ struct Progress {
     committed: BigUint,
     cursor: BigUint,
     matches: Vec<Match>,
+    audits: Vec<Audit>,
     active: Duration,
+    backend: &'static str,
     last_commit: Instant,
 }
 
 impl Progress {
-    fn commit(&mut self, store: &mut Store, ctx: &WorkerContext) -> Result<bool> {
+    fn commit(&mut self, store: &mut Store, hardware: &str) -> Result<bool> {
         let candidates = (&self.cursor - &self.committed)
             .to_u64()
             .ok_or_else(|| anyhow!("uncommitted progress exceeds u64"))?;
@@ -260,20 +255,29 @@ impl Progress {
             from: &self.committed,
             to: &self.cursor,
             matches: &self.matches,
+            audits: &self.audits,
             candidates,
             active: self.active,
-            hardware: &ctx.hardware,
-            backend: CPU_BACKEND,
+            hardware,
+            backend: self.backend,
         })?;
         self.committed = self.cursor.clone();
         self.matches.clear();
+        self.audits.clear();
         self.active = Duration::ZERO;
         self.last_commit = Instant::now();
         Ok(complete)
     }
 }
 
-fn search_claim(ctx: &WorkerContext, store: &mut Store, claim: Claim, batch: &mut u64) -> Result<()> {
+fn search_claim(
+    ctx: &WorkerContext,
+    store: &mut Store,
+    engine: &mut Engine,
+    hardware: &str,
+    claim: Claim,
+    batch: &mut u64,
+) -> Result<()> {
     let space = claim.chunk.validate()?;
     let end = claim.chunk.end_index.clone();
     let mut progress = Progress {
@@ -281,29 +285,37 @@ fn search_claim(ctx: &WorkerContext, store: &mut Store, claim: Claim, batch: &mu
         committed: claim.next_index.clone(),
         cursor: claim.next_index,
         matches: Vec::new(),
+        audits: Vec::new(),
         active: Duration::ZERO,
+        backend: "",
         last_commit: Instant::now(),
     };
     debug!(chunk = %progress.chunk_id, resume_from = %progress.cursor, "claimed chunk");
 
     while progress.cursor < end && ctx.control.state() == RUN {
         let batch_end = (&progress.cursor + *batch).min(end.clone());
-        let result = search_range(space, &progress.cursor, &batch_end)?;
-        *batch = next_batch_size(result.candidates_checked, result.elapsed, ctx.batch_target);
-        progress.active += result.elapsed;
+        let output = engine.run_batch(space, &progress.cursor, &batch_end)?;
+        *batch = next_batch_size(output.candidates, output.elapsed, ctx.batch_target).min(engine.max_batch());
+        if output.backend != progress.backend && progress.cursor > progress.committed {
+            // Never attribute one backend's work to another.
+            progress.commit(store, hardware)?;
+        }
+        progress.backend = output.backend;
+        progress.active += output.elapsed;
         progress.cursor = batch_end;
 
-        let nontrivial: Vec<String> = result
+        let nontrivial: Vec<String> = output
             .matches
             .iter()
             .filter(|m| m.verification.is_nontrivial())
             .map(|m| m.verification.decimal.clone())
             .collect();
-        let found = !result.matches.is_empty();
-        progress.matches.extend(result.matches);
+        let found = !output.matches.is_empty();
+        progress.matches.extend(output.matches);
+        progress.audits.extend(output.audits);
 
         if found || progress.cursor == end || progress.last_commit.elapsed() >= ctx.checkpoint_interval {
-            progress.commit(store, ctx)?;
+            progress.commit(store, hardware)?;
         }
         for decimal in nontrivial {
             warn!(%decimal, chunk = %progress.chunk_id, "VERIFIED NONTRIVIAL TRIPLE PALINDROME");
@@ -315,7 +327,7 @@ fn search_claim(ctx: &WorkerContext, store: &mut Store, claim: Claim, batch: &mu
     }
 
     if progress.cursor > progress.committed {
-        progress.commit(store, ctx)?;
+        progress.commit(store, hardware)?;
     }
     if progress.cursor < end {
         store.release(&progress.chunk_id)?;

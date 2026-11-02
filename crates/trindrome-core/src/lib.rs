@@ -6,6 +6,7 @@
 //!
 //! It deliberately knows nothing about Windows, CUDA, SQLite or networking.
 
+pub mod filter;
 pub mod generator;
 pub mod palindrome;
 pub mod verification;

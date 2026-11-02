@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 trindrome-core.workspace = true
 trindrome-cpu.workspace = true
+trindrome-cuda.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
