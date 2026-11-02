@@ -1,0 +1,15 @@
+[package]
+name = "trindrome-core"
+description = "Platform-independent candidate generation and palindrome checks for Trindrome"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+num-bigint.workspace = true
+num-traits.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/trindrome-core", "crates/trindrome-cpu"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+trindrome-core = { path = "crates/trindrome-core" }
+num-bigint = "0.5"
+num-traits = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# Big-integer arithmetic is painfully slow unoptimized; keep debug builds and
+# tests usable without hiding our own code from the debugger.
+[profile.dev.package.num-bigint]
+opt-level = 3

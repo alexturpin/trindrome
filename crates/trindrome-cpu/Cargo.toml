@@ -1,0 +1,13 @@
+[package]
+name = "trindrome-cpu"
+description = "Exact CPU reference search backend for Trindrome"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+trindrome-core.workspace = true
+num-bigint.workspace = true
+
+[dev-dependencies]
+num-traits.workspace = true
