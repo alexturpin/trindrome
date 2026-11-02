@@ -1,6 +1,6 @@
 # Distributed search (design)
 
-Status: **design only, nothing implemented.** This is the plan for phase 5, which turns spec §14 into concrete decisions. Where it departs from the spec, the reasons are under [Deviations from spec §14](#deviations-from-spec-14).
+Status: **phases 5a and 5b are implemented and tested locally with `wrangler dev`; nothing is deployed.** This is the plan for phase 5, which turns spec §14 into concrete decisions. [Implementation status](#implementation-status) lists what is built and where the implementation differs from the design. Where the design departs from the spec, the reasons are under [Deviations from spec §14](#deviations-from-spec-14).
 
 Friends, and later the public, run the same agent. A coordinator on Cloudflare decides *what* each machine searches. Each machine's local resource policy still decides *whether* it runs. The search engine, the work-unit format and the local checkpoint rule do not change.
 
@@ -33,7 +33,7 @@ trindrome-agent (each PC)                 Cloudflare
 - **R2** holds survivor lists (needed to compare replicas), discovery records and periodic coverage snapshots for the public statistics page.
 - **No D1, no Queues.** The DO's SQLite is enough. Add them only for a need this design doesn't have.
 
-Both are written in Rust with [workers-rs](https://github.com/cloudflare/workers-rs) in a new crate, `crates/trindrome-coordinator` (target `wasm32-unknown-unknown`). It depends on `trindrome-core`, so chunk validation (`WorkChunk::validate`), the decimal filter and discovery verification (`Verification::of`) run **the same code** on the server as on the workers. There is no second big-integer implementation to drift. If workers-rs turns out to be awkward for Durable Objects, the fallback is a TypeScript Worker that calls `trindrome-core` compiled with wasm-bindgen.
+The Worker and the Durable Object are a standard TypeScript Workers project in `cloud/coordinator`, run with `wrangler`. Everything mathematical is `trindrome-core` itself, compiled to wasm with wasm-bindgen (`crates/trindrome-wasm`). Chunk identities, the decimal filter and discovery verification therefore run **the same code** on the server as on the workers. There is no second big-integer implementation to drift. (An earlier draft proposed workers-rs. A TypeScript Worker is Cloudflare's main path and keeps the tooling standard, at the cost of a thin wasm boundary.)
 
 ## Proof of work: survivor sets
 
@@ -43,9 +43,9 @@ The GPU's decimal filter (W = 9, [cuda-design.md](cuda-design.md#decimal-filter)
 
 | Property | Why it holds |
 |---|---|
-| Can't be faked | Naming survivors requires evaluating the filter on every candidate, which is the search. |
+| Can't be faked | Naming survivors requires evaluating the filter on every candidate, which is the search. A cleverer method of finding them all is fine: a complete survivor set plus exact checks *is* a complete search, because the filter never rejects a palindrome. |
 | Cheap to check | The server re-evaluates any reported index in microseconds, using the same Rust code. |
-| Predictable size | About 10⁻⁹ × range length. A 3 × 10¹² segment has about 3,000 survivors (σ ≈ 55). |
+| Roughly predictable size | About 10⁻⁹ × range length on average, but **not uniform** (see the count test below). |
 | Identical everywhere | Generic kernels, per-length kernels and the Rust reference already agree exactly on survivors; the differential tests enforce it. |
 | Contains every discovery | A triple palindrome always passes the filter, so it is always a survivor. |
 
@@ -62,11 +62,9 @@ A segment's survivors are encoded as `u64` offsets from the segment start, in as
 The Worker, before anything reaches the coordinator:
 
 1. **Well-formed:** offsets strictly increasing, all inside the segment.
-2. **Spot check:** 32 entries chosen at random *after* the upload, each re-evaluated through the filter. A single fabricated survivor rejects the submission.
-3. **Exact check:** every survivor is rebuilt and checked with `Verification::of`. At about 3,000 survivors this is tens of milliseconds of CPU. This catches discoveries the worker missed or failed to report.
-4. **Count test:** the count must lie within ±6σ of the expected count for that range. The expected rate is calibrated per space from accepted, replicated segments (survivors are close to uniform, but not exactly). Skipping 5% or more of a segment fails this outright.
-
-The count test catches lazy cheating and gross hardware faults. Replication (below) catches subtle skipping and faults the count can't see.
+2. **Filter check:** *every* survivor is re-evaluated through the filter. That is cheaper than the exact check that follows anyway, so there is no point in sampling. A single fabricated survivor rejects the submission.
+3. **Exact check:** every survivor is rebuilt and checked exactly. This catches discoveries the worker missed or failed to report.
+4. **Count test (not implemented):** the idea was to require the count to lie within a few σ of the expected count. **Survivor density turns out not to be uniform.** Within a range, the top binary digits are fixed, and they fix both the leading decimal digits and the value modulo small powers of two. So the density depends on where the range lies: from exactly zero (where the leading decimal digit is even, so no palindrome can exist) to several times the average. A useful count test needs a per-range expected density, which is still an open problem. Until then, replication is the only guarantee of completeness.
 
 ## Work units: chunks, leases and segments
 
@@ -180,13 +178,16 @@ Indices are canonical decimal strings, as locally. `chunks.cursor` mirrors the e
 ## Changes to the agent
 
 - **Remote mode** in `trindrome-worker`, chosen in `trindrome.toml` (`[coordinator] url = …`), with local-only mode staying the default. In remote mode the coordinator owns allocation, and the local `next_unallocated` cursor is unused.
-- **Local journal additions:**
-  - lease columns on `work_chunks` (`lease_id`, `epoch`, `expires_at`);
-  - an `outbox` of committed segments with their survivor lists, deleted once acknowledged.
-- **Keep survivors.** The CUDA engine already collects survivor offsets per batch (as `u32` offsets from the batch start). The checkpoint transaction will also store them, converted to offsets from the chunk start, so each segment can be uploaded with its proof. CPU workers produce the same set with `filter::scan`.
-- **A sync thread** handles acquire, reports, releases and the outbox. It never blocks the engine: if the coordinator can't be reached, the engine keeps searching its current lease and stops only when it runs out of leased work.
-- **Policy is unchanged.** A pause longer than about 2 minutes releases the lease. Shorter pauses keep it.
-- `trindrome status` shows the coordinator connection, the current lease and the outbox length. `trindrome coverage` can show the global picture from `GET /v1/coverage`.
+- **Local journal additions** (store schema v3):
+  - a `leases` table: lease ID, epoch, expiry, the end of the accepted work, and when the worker paused;
+  - a `segments` table: every checkpoint of a leased chunk with its survivor set, kept until the coordinator accepts or supersedes it.
+
+  Leased chunks are ordinary `work_chunks` rows, so the checkpoint rule, crash recovery and `trindrome verify` cover them. They are left out of local allocation and of the local tiling check.
+- **Survivors from both engines.** The CUDA engine already returns each batch's survivors; on overflow the Rust reference filter recomputes them. The CPU engine runs the reference filter alongside the exact search.
+- **Search threads lease work** when they have none, and wait (shown as a back-off) when the coordinator can't be reached or has nothing to give.
+- **A sync thread** uploads segments, renews leases and hands back paused ones. It never blocks the engine: if the coordinator can't be reached, segments wait in the database. When the worker stops, the sync thread stops after the search threads and spends up to 15 s handing everything over.
+- **Policy is unchanged.** A pause longer than `release_after_pause_seconds` (default 120) releases the lease. Shorter pauses keep it.
+- `trindrome status` doesn't show the coordinator connection yet.
 
 ## Failure cases
 
@@ -213,9 +214,84 @@ Requests are few: a few per GPU every 5 minutes. The bulk of the cost is CPU tim
 | **5c. Friends** | Replication and trust levels, voiding on mismatch, the agent's outbox hardened against flaky connections. |
 | **5d. Public** | The coverage page from R2 snapshots, discovery notifications, tuned limits. |
 
+## Implementation status
+
+Built (phases 5a and 5b):
+
+- **`trindrome-core::proof`:** `FILTER_VERSION`, the survivor encoding, digest and `check_segment`.
+- **`crates/trindrome-wasm`:** the core exported to the Worker.
+- **`cloud/coordinator`:**
+  - the Worker: signatures, both rate-limit layers, survivor checks, R2;
+  - the Coordinator Durable Object: registration, leases, epochs, lazy expiry, segments, coverage.
+- **The agent's distributed mode:**
+  - `[coordinator] url`;
+  - the identity key under DPAPI;
+  - `remote.rs` (client and sync thread);
+  - store schema v3 with `leases` and `segments`;
+  - survivors returned by both engines.
+
+Tested end to end against `wrangler dev`, with CPU and GPU workers on one machine:
+- registration and signed requests;
+- leasing, reporting and completing chunks, at about 6.4 billion candidates/s on the RTX 3070 Laptop;
+- pause → release after the grace period, and resume → re-lease of the remainder;
+- graceful stop handing everything back;
+- an expired lease reassigned to a second worker, with the first worker's late report refused as `superseded`;
+- rejection of bad signatures, unknown versions, fabricated survivors and out-of-order segments;
+- the registration rate limit.
+
+`trindrome verify` passes on both workers' databases.
+
+Not built yet, or different from the design above:
+
+- **No replication or trust levels (phase 5c).** Every worker is `new`, and nothing is confirmed. Run only trusted machines until 5c exists.
+- **No count test.** See [Checks on every submission](#checks-on-every-submission).
+- **Late uploads under a superseded lease** are accepted only if the chunk is unclaimed and they continue exactly from its cursor. Overlapping uploads are discarded rather than compared as free replicas.
+- **One lease at a time for a `new` worker.** A GPU therefore waits about a second between chunks for its last report to be accepted. That doesn't matter at 30-minute chunks, but a multi-threaded CPU worker uses only one thread.
+- **Coverage is served live** from the Durable Object, not from R2 snapshots.
+- **No DO alarm.** Expiry is lazy only.
+- **No GPU UUID hash** at registration.
+- **`trindrome status` knows nothing about leases yet.**
+- **Spaces with more than 2⁶⁴ candidates are never leased.** Survivors are 64-bit indices, and the GPU is limited to them too.
+
+### Running it locally
+
+Needs the `wasm32-unknown-unknown` Rust target and `wasm-bindgen-cli` 0.2.130, the version `crates/trindrome-wasm` pins:
+
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
+```bash
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
+```
+
+Then, in `cloud/coordinator`:
+
+```bash
+npm install
+```
+
+```bash
+cp .dev.vars.example .dev.vars
+```
+
+```bash
+npm run dev
+```
+
+`npm run dev` builds the wasm module and starts `wrangler dev` on port 8787. `.dev.vars` shortens lease timings, so expiry and release can be watched within a minute. Point a worker at it with a configuration like this one, and run `trindrome --config that.toml run --now`:
+
+```toml
+[coordinator]
+url = "http://127.0.0.1:8787"
+release_after_pause_seconds = 10
+```
+
+`GET /v1/coverage` shows the coordinator's view.
+
 ## Deviations from spec §14
 
 - **Proof of work through survivor sets.** The spec leaves the "false negatives" problem open. Survivor sets solve it more cheaply than full redundant execution, because only a sample of established workers' work is repeated.
 - **No authentication by the user.** The spec asks for "authenticated HTTPS endpoints". Requests are authenticated with a key the agent creates itself, so no person ever signs in. Abuse is limited by rate limits and the trust model, not by accounts.
-- **Server-side checks in Rust (wasm).** Not in the spec. They keep the server's checks identical to the workers'.
+- **Server-side checks in Rust (wasm), called from a TypeScript Worker.** Not in the spec. They keep the server's checks identical to the workers'.
 - **Segments instead of one result per chunk.** Progress reports are results, so a paused or vanished worker's finished work is never discarded.

@@ -4,12 +4,13 @@ A GPU-accelerated search for a [number that's palindromic](https://en.wikipedia.
 
 Candidates come from Rick Regan's structure of binary/hexadecimal palindromes, so only the decimal property has to be tested. See [docs/algorithm.md](docs/algorithm.md) for the mathematics and [docs/architecture.md](docs/architecture.md) for the worker, its resource policy and storage. The plan lives in [spec.md](spec.md), and the design for distributing the search over Cloudflare in [docs/distributed.md](docs/distributed.md).
 
-**Status:** Phases 1–4 are done.
+**Status:** Phases 1–4 are done; phase 5 (distribution) is under way.
 
 - **Exact CPU reference search**, exhaustively tested.
 - **Resumable local worker** that survives crashes and kills.
 - **CUDA backend** at 6–16 billion candidates/s on an RTX 3070 Laptop GPU (per-length kernels, with batches overlapped with host work), with every survivor verified on the CPU ([docs/cuda-design.md](docs/cuda-design.md), [docs/benchmarks.md](docs/benchmarks.md)). A full replay of Regan's 2010 coverage (28.6 billion candidates) takes 19 seconds and finds no nontrivial triple palindrome.
 - **Passive Windows operation:** it computes only while you're away, pauses for games, battery power and heat, and runs as a windowless agent at login.
+- **Distributed mode (experimental, phase 5):** with `[coordinator] url` set, workers lease work from a Cloudflare Worker and Durable Object coordinator and prove each result with its filter survivor set. It is tested locally with `wrangler dev` but not deployed, and has no replication yet, so it is for machines you trust. See [docs/distributed.md](docs/distributed.md).
 
 ## Setup (Windows 11)
 

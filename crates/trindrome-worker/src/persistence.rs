@@ -6,6 +6,7 @@
 //! (`[start_index, next_index)` of every chunk), so there is no second ledger that
 //! could drift from them.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +19,7 @@ use trindrome_cpu::Match;
 use crate::configuration::Search;
 use crate::engine::Audit;
 
-pub const STORE_SCHEMA_VERSION: u32 = 2;
+pub const STORE_SCHEMA_VERSION: u32 = 3;
 
 /// Leading digits sharing an alphabet size, with the last length Regan covered in 2010.
 /// Each track advances through hexadecimal lengths independently.
@@ -171,6 +172,39 @@ CREATE TABLE IF NOT EXISTS audits (
 ) STRICT;
 "#;
 
+/// Distributed mode (v3). A chunk leased from a coordinator has a `leases` row,
+/// and every checkpoint of it stores a segment with its survivor set until the
+/// coordinator has accepted it.
+const REMOTE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS leases (
+    chunk_id TEXT PRIMARY KEY REFERENCES work_chunks (id),
+    lease_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active', 'released', 'complete', 'superseded', 'rejected')),
+    expires_at INTEGER NOT NULL,
+    report_interval_seconds INTEGER NOT NULL,
+    -- End of the work the coordinator has accepted.
+    reported_index TEXT NOT NULL,
+    last_contact_at INTEGER NOT NULL,
+    -- When the worker last handed the chunk back locally, e.g. for a game.
+    paused_since INTEGER,
+    note TEXT
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS segments (
+    id INTEGER PRIMARY KEY,
+    chunk_id TEXT NOT NULL REFERENCES work_chunks (id),
+    start_index TEXT NOT NULL,
+    end_index TEXT NOT NULL,
+    -- Absolute survivor indices as little-endian u64s.
+    survivors BLOB NOT NULL,
+    backend TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'accepted', 'discarded'))
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS segments_by_chunk ON segments (chunk_id, state);
+"#;
+
 #[derive(Clone, Debug)]
 pub struct SpaceRow {
     pub space: SearchSpace,
@@ -196,6 +230,8 @@ impl SpaceRow {
 pub struct Claim {
     pub chunk: WorkChunk,
     pub next_index: BigUint,
+    /// Leased from a coordinator: checkpoints must carry survivor sets.
+    pub leased: bool,
 }
 
 pub struct Checkpoint<'a> {
@@ -211,6 +247,9 @@ pub struct Checkpoint<'a> {
     pub active: Duration,
     pub hardware: &'a str,
     pub backend: &'a str,
+    /// Absolute indices in `[from, to)` that pass the decimal filter. Required
+    /// for leased chunks, whose coordinator needs them as proof.
+    pub survivors: Option<&'a [u64]>,
 }
 
 #[derive(Clone, Debug)]
@@ -258,6 +297,45 @@ pub struct WorkerRow {
     pub detail: Option<String>,
 }
 
+/// A lease granted by the coordinator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseGrant {
+    pub lease_id: String,
+    pub epoch: i64,
+    pub chunk: WorkChunk,
+    /// Everything before it is already accepted by the coordinator.
+    pub cursor: BigUint,
+    pub expires_at: i64,
+    pub report_interval_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct LeaseRow {
+    pub chunk: WorkChunk,
+    pub lease_id: String,
+    pub epoch: i64,
+    pub state: String,
+    pub expires_at: i64,
+    pub report_interval_seconds: u64,
+    pub reported_index: BigUint,
+    pub last_contact_at: i64,
+    pub paused_since: Option<i64>,
+    pub note: Option<String>,
+    /// The local chunk's state and cursor.
+    pub chunk_state: String,
+    pub next_index: BigUint,
+}
+
+/// Committed progress on a leased chunk, with its survivor set.
+#[derive(Clone, Debug)]
+pub struct SegmentRow {
+    pub id: i64,
+    pub start: BigUint,
+    pub end: BigUint,
+    pub survivors: Vec<u64>,
+    pub backend: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Totals {
     pub candidates: u64,
@@ -302,6 +380,12 @@ impl Store {
             )?;
             version = "2".into();
         }
+        if version == "2" {
+            // v3: leases and segments for distributed mode.
+            conn.execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'", [])?;
+            version = "3".into();
+        }
+        conn.execute_batch(REMOTE_SCHEMA)?;
         ensure!(
             version == STORE_SCHEMA_VERSION.to_string(),
             "database schema version {version} is not supported (this build uses {STORE_SCHEMA_VERSION})"
@@ -349,7 +433,8 @@ impl Store {
         {
             let mut stmt = tx.prepare(
                 "SELECT hex_digits, leading_digit, start_index, end_index, next_index FROM work_chunks
-                 WHERE state = 'pending' AND generator_version = ?1",
+                 WHERE state = 'pending' AND generator_version = ?1
+                   AND id NOT IN (SELECT chunk_id FROM leases)",
             )?;
             let rows = stmt.query_map([GENERATOR_VERSION], |r| {
                 Ok((
@@ -375,6 +460,7 @@ impl Store {
                     Claim {
                         chunk,
                         next_index: parse_big(&next)?,
+                        leased: false,
                     },
                 ));
             }
@@ -414,6 +500,7 @@ impl Store {
             Claim {
                 chunk,
                 next_index: start,
+                leased: false,
             }
         } else {
             return Ok(None);
@@ -493,6 +580,29 @@ impl Store {
             )?;
         }
 
+        let leased = tx
+            .query_row("SELECT 1 FROM leases WHERE chunk_id = ?1", [cp.chunk_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if leased {
+            let survivors = cp
+                .survivors
+                .ok_or_else(|| anyhow!("leased chunk {} checkpointed without survivors", cp.chunk_id))?;
+            ensure!(
+                survivors.windows(2).all(|w| w[0] < w[1])
+                    && survivors
+                        .iter()
+                        .all(|&i| BigUint::from(i) >= *cp.from && BigUint::from(i) < *cp.to),
+                "survivors of chunk {} are unsorted or outside the progress",
+                cp.chunk_id
+            );
+            let blob: Vec<u8> = survivors.iter().flat_map(|i| i.to_le_bytes()).collect();
+            tx.execute(
+                "INSERT INTO segments (chunk_id, start_index, end_index, survivors, backend) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![cp.chunk_id, cp.from.to_string(), cp.to.to_string(), blob, cp.backend],
+            )?;
+        }
+
         let complete = *cp.to == end;
         let now = now_ms();
         let active_ms = cp.active.as_millis() as i64;
@@ -552,6 +662,10 @@ impl Store {
         self.conn.execute(
             "UPDATE work_chunks SET state = 'pending' WHERE id = ?1 AND state = 'running'",
             [chunk_id],
+        )?;
+        self.conn.execute(
+            "UPDATE leases SET paused_since = ?2 WHERE chunk_id = ?1 AND paused_since IS NULL",
+            params![chunk_id, now_ms()],
         )?;
         Ok(())
     }
@@ -783,12 +897,52 @@ impl Store {
         Ok(candidates as f64 / ((now - since) as f64 / 1000.0).max(1.0))
     }
 
+    /// Candidates per second of active computing over the trailing `window`,
+    /// or 0 if nothing was computed in it.
+    pub fn active_rate(&self, window: Duration) -> Result<f64> {
+        let since = now_ms() - window.as_millis() as i64;
+        let (candidates, active_ms): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(candidates), 0), COALESCE(SUM(active_ms), 0) FROM performance_samples
+             WHERE recorded_at >= ?1",
+            [since],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(if active_ms > 0 {
+            candidates as f64 * 1000.0 / active_ms as f64
+        } else {
+            0.0
+        })
+    }
+
+    /// Whether a finished leased chunk is still waiting for its last report,
+    /// after which the coordinator will lease more work.
+    pub fn awaiting_final_report(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM leases l JOIN work_chunks w ON w.id = l.chunk_id
+                 WHERE l.state = 'active' AND w.state = 'complete' LIMIT 1",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Checks the chunk ledger and discoveries for anything inconsistent.
     pub fn verify_integrity(&self) -> Result<Vec<String>> {
         let mut problems = Vec::new();
         let chunks = self.chunks()?;
+        let leased = self.leased_chunk_ids()?;
+        for c in chunks.iter().filter(|c| leased.contains(&c.id)) {
+            // Leased ranges come from the coordinator and need not tile anything locally.
+            problems.extend(chunk_problems(c));
+        }
         for row in self.spaces()? {
-            let mut mine: Vec<&ChunkRow> = chunks.iter().filter(|c| c.space == row.space).collect();
+            let mut mine: Vec<&ChunkRow> = chunks
+                .iter()
+                .filter(|c| c.space == row.space && !leased.contains(&c.id))
+                .collect();
             mine.sort_by(|a, b| a.start.cmp(&b.start));
             let mut cursor = BigUint::ZERO;
             for c in mine {
@@ -798,20 +952,7 @@ impl Store {
                         c.id, c.start
                     ));
                 }
-                if !(c.start <= c.next && c.next <= c.end && c.start < c.end) {
-                    problems.push(format!("{}: cursor {} outside [{}, {})", c.id, c.next, c.start, c.end));
-                }
-                if (c.state == "complete") != (c.next == c.end) {
-                    problems.push(format!(
-                        "{}: state {} disagrees with cursor {} of {}",
-                        c.id, c.state, c.next, c.end
-                    ));
-                }
-                match WorkChunk::new(row.space, c.start.clone(), c.end.clone()) {
-                    Ok(chunk) if chunk.id() == c.id => {}
-                    Ok(chunk) => problems.push(format!("{}: id should be {}", c.id, chunk.id())),
-                    Err(e) => problems.push(format!("{}: {e}", c.id)),
-                }
+                problems.extend(chunk_problems(c));
                 cursor = c.end.clone();
             }
             if cursor != row.next_unallocated {
@@ -856,6 +997,231 @@ impl Store {
         Ok(problems)
     }
 
+    /// Records a lease from the coordinator. Returns false if it was already recorded.
+    ///
+    /// A chunk leased again keeps its local cursor and unreported segments only
+    /// if they continue exactly where the coordinator's accepted work ends;
+    /// otherwise it restarts from the coordinator's cursor.
+    pub fn record_lease(&mut self, grant: &LeaseGrant) -> Result<bool> {
+        let space = grant.chunk.validate()?;
+        let chunk_id = grant.chunk.id();
+        ensure!(
+            grant.chunk.start_index <= grant.cursor && grant.cursor < grant.chunk.end_index,
+            "lease cursor {} is outside {chunk_id}",
+            grant.cursor
+        );
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_space(&tx, space)?;
+        let previous: Option<(String, String)> = tx
+            .query_row(
+                "SELECT lease_id, reported_index FROM leases WHERE chunk_id = ?1",
+                [&chunk_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if previous
+            .as_ref()
+            .is_some_and(|(lease_id, _)| *lease_id == grant.lease_id)
+        {
+            return Ok(false);
+        }
+        let cursor = grant.cursor.to_string();
+        let exists = tx
+            .query_row("SELECT 1 FROM work_chunks WHERE id = ?1", [&chunk_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            tx.execute(
+                "INSERT INTO work_chunks
+                 (id, generator_version, hex_digits, leading_digit, start_index, end_index, next_index, state, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+                params![
+                    chunk_id,
+                    GENERATOR_VERSION,
+                    space.hex_digits(),
+                    space.leading(),
+                    grant.chunk.start_index.to_string(),
+                    grant.chunk.end_index.to_string(),
+                    cursor,
+                    now_ms()
+                ],
+            )?;
+        } else if previous.is_none_or(|(_, reported)| reported != cursor) {
+            tx.execute(
+                "UPDATE work_chunks SET next_index = ?2, state = 'pending', completed_at = NULL WHERE id = ?1",
+                params![chunk_id, cursor],
+            )?;
+            tx.execute(
+                "UPDATE segments SET state = 'discarded' WHERE chunk_id = ?1 AND state = 'pending'",
+                [&chunk_id],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO leases
+             (chunk_id, lease_id, epoch, state, expires_at, report_interval_seconds, reported_index, last_contact_at)
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7)",
+            params![
+                chunk_id,
+                grant.lease_id,
+                grant.epoch,
+                grant.expires_at,
+                grant.report_interval_seconds as i64,
+                cursor,
+                now_ms()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Atomically takes a leased chunk with work left, if any.
+    pub fn claim_leased(&mut self) -> Result<Option<Claim>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(u32, u8, String, String, String)> = tx
+            .query_row(
+                "SELECT w.hex_digits, w.leading_digit, w.start_index, w.end_index, w.next_index
+                 FROM work_chunks w JOIN leases l ON l.chunk_id = w.id
+                 WHERE l.state = 'active' AND w.state = 'pending' AND w.generator_version = ?1
+                 ORDER BY l.expires_at LIMIT 1",
+                [GENERATOR_VERSION],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((n, lead, start, end, next)) = row else {
+            return Ok(None);
+        };
+        let chunk = WorkChunk::new(SearchSpace::new(n, lead)?, parse_big(&start)?, parse_big(&end)?)?;
+        tx.execute(
+            "UPDATE work_chunks SET state = 'running', attempts = attempts + 1, last_checkpoint_at = ?2 WHERE id = ?1",
+            params![chunk.id(), now_ms()],
+        )?;
+        tx.execute(
+            "UPDATE leases SET paused_since = NULL WHERE chunk_id = ?1",
+            [chunk.id()],
+        )?;
+        tx.commit()?;
+        Ok(Some(Claim {
+            chunk,
+            next_index: parse_big(&next)?,
+            leased: true,
+        }))
+    }
+
+    pub fn lease_state(&self, chunk_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT state FROM leases WHERE chunk_id = ?1", [chunk_id], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn leases(&self, state: &str) -> Result<Vec<LeaseRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.hex_digits, w.leading_digit, w.start_index, w.end_index, l.reported_index, w.next_index,
+                    l.lease_id, l.epoch, l.state, l.expires_at, l.report_interval_seconds, l.last_contact_at,
+                    l.paused_since, l.note, w.state
+             FROM leases l JOIN work_chunks w ON w.id = l.chunk_id WHERE l.state = ?1 ORDER BY l.expires_at",
+        )?;
+        let mut rows = stmt.query([state])?;
+        let mut leases = Vec::new();
+        while let Some(r) = rows.next()? {
+            let space = SearchSpace::new(r.get(0)?, r.get(1)?)?;
+            let (start, end): (String, String) = (r.get(2)?, r.get(3)?);
+            let (reported, next): (String, String) = (r.get(4)?, r.get(5)?);
+            leases.push(LeaseRow {
+                chunk: WorkChunk::new(space, parse_big(&start)?, parse_big(&end)?)?,
+                reported_index: parse_big(&reported)?,
+                next_index: parse_big(&next)?,
+                lease_id: r.get(6)?,
+                epoch: r.get(7)?,
+                state: r.get(8)?,
+                expires_at: r.get(9)?,
+                report_interval_seconds: r.get::<_, i64>(10)? as u64,
+                last_contact_at: r.get(11)?,
+                paused_since: r.get(12)?,
+                note: r.get(13)?,
+                chunk_state: r.get(14)?,
+            });
+        }
+        Ok(leases)
+    }
+
+    /// Committed segments of a chunk not yet accepted by the coordinator, in order.
+    pub fn pending_segments(&self, chunk_id: &str) -> Result<Vec<SegmentRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, start_index, end_index, survivors, backend FROM segments
+             WHERE chunk_id = ?1 AND state = 'pending' ORDER BY id",
+        )?;
+        let rows = stmt.query_map([chunk_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, start, end, blob, backend) = row?;
+            ensure!(blob.len() % 8 == 0, "segment {id} has a corrupt survivor list");
+            Ok(SegmentRow {
+                id,
+                start: parse_big(&start)?,
+                end: parse_big(&end)?,
+                survivors: blob.as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).collect(),
+                backend,
+            })
+        })
+        .collect()
+    }
+
+    pub fn pending_segment_count(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM segments WHERE state = 'pending'", [], |r| {
+                r.get::<_, i64>(0)
+            })? as u64)
+    }
+
+    /// Marks segments `accepted` or `discarded`.
+    pub fn settle_segments(&self, ids: &[i64], state: &str) -> Result<()> {
+        for id in ids {
+            self.conn
+                .execute("UPDATE segments SET state = ?2 WHERE id = ?1", params![id, state])?;
+        }
+        Ok(())
+    }
+
+    /// Records a reply from the coordinator about a lease.
+    pub fn update_lease(
+        &self,
+        chunk_id: &str,
+        state: &str,
+        reported_index: Option<&BigUint>,
+        expires_at: Option<i64>,
+        note: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE leases SET state = ?2, reported_index = COALESCE(?3, reported_index),
+                 expires_at = COALESCE(?4, expires_at), note = COALESCE(?5, note), last_contact_at = ?6
+             WHERE chunk_id = ?1",
+            params![
+                chunk_id,
+                state,
+                reported_index.map(|i| i.to_string()),
+                expires_at,
+                note,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn leased_chunk_ids(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT chunk_id FROM leases")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     fn chunks(&self) -> Result<Vec<ChunkRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, hex_digits, leading_digit, start_index, end_index, next_index, state FROM work_chunks
@@ -885,6 +1251,26 @@ impl Store {
         })
         .collect()
     }
+}
+
+/// Inconsistencies within one chunk record.
+fn chunk_problems(c: &ChunkRow) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !(c.start <= c.next && c.next <= c.end && c.start < c.end) {
+        problems.push(format!("{}: cursor {} outside [{}, {})", c.id, c.next, c.start, c.end));
+    }
+    if (c.state == "complete") != (c.next == c.end) {
+        problems.push(format!(
+            "{}: state {} disagrees with cursor {} of {}",
+            c.id, c.state, c.next, c.end
+        ));
+    }
+    match WorkChunk::new(c.space, c.start.clone(), c.end.clone()) {
+        Ok(chunk) if chunk.id() == c.id => {}
+        Ok(chunk) => problems.push(format!("{}: id should be {}", c.id, chunk.id())),
+        Err(e) => problems.push(format!("{}: {e}", c.id)),
+    }
+    problems
 }
 
 struct ChunkRow {

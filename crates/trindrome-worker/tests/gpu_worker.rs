@@ -40,7 +40,7 @@ fn prefetched_batches_are_used_or_discarded_correctly() {
 
     // Batch [0, 1M) prefetches [1M, 2M).
     let first = engine
-        .run_batch(space, &b(0), &b(1 << 20), &compute, Some(&b(2 << 20)))
+        .run_batch(space, &b(0), &b(1 << 20), &compute, Some(&b(2 << 20)), false)
         .unwrap();
     assert_eq!(first.candidates, 1 << 20);
     assert_eq!(engine.prefetched_end(space, &b(1 << 20)), Some(b(2 << 20)));
@@ -48,14 +48,14 @@ fn prefetched_batches_are_used_or_discarded_correctly() {
 
     // Using the prefetch, and prefetching again.
     let second = engine
-        .run_batch(space, &b(1 << 20), &b(2 << 20), &compute, Some(&b(3 << 20)))
+        .run_batch(space, &b(1 << 20), &b(2 << 20), &compute, Some(&b(3 << 20)), false)
         .unwrap();
     assert_eq!((second.candidates, second.audits.len()), (1 << 20, 1));
     assert!(second.audits[0].matched());
 
     // A different range than the prefetch: the stale batch is discarded.
     let other = engine
-        .run_batch(space, &b(5 << 20), &b(6 << 20), &compute, None)
+        .run_batch(space, &b(5 << 20), &b(6 << 20), &compute, None, false)
         .unwrap();
     assert_eq!(other.candidates, 1 << 20);
     assert!(
@@ -68,13 +68,13 @@ fn prefetched_batches_are_used_or_discarded_correctly() {
 
     // Releasing resources drops any prefetch, and the engine reopens on demand.
     engine
-        .run_batch(space, &b(0), &b(1000), &compute, Some(&b(2000)))
+        .run_batch(space, &b(0), &b(1000), &compute, Some(&b(2000)), false)
         .unwrap();
     engine.release_resources();
     assert_eq!(engine.prefetched_end(space, &b(1000)), None);
     assert_eq!(
         engine
-            .run_batch(space, &b(1000), &b(2000), &compute, None)
+            .run_batch(space, &b(1000), &b(2000), &compute, None, false)
             .unwrap()
             .candidates,
         1000

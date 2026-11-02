@@ -8,6 +8,10 @@
 //! [`Policy`] whether computing is allowed, combines that with manual pause/stop
 //! requests and error back-off, reloads the configuration file if it changed,
 //! and records the state and its reason for the CLI and front ends.
+//!
+//! With `coordinator.url` set, search threads lease chunks from the coordinator
+//! instead of allocating them, and a sync thread reports the results
+//! ([`crate::remote`]).
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
@@ -27,6 +31,7 @@ use crate::engine::{Audit, Engine, is_retryable};
 use crate::persistence::{Checkpoint, Claim, Requested, Store};
 use crate::policy::{Decision, Policy, PolicySettings, Reason};
 use crate::power;
+use crate::remote::{Acquired, Client};
 use crate::sensors::SystemSensors;
 
 const CONTROL_POLL: Duration = Duration::from_millis(250);
@@ -34,6 +39,7 @@ const POLICY_INTERVAL: Duration = Duration::from_secs(1);
 const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(15);
 const MAX_BACKOFF: Duration = Duration::from_secs(600);
+const COORDINATOR_RETRY: Duration = Duration::from_secs(30);
 
 /// Exclusive ownership of a database by one worker process.
 pub struct InstanceLock {
@@ -150,6 +156,8 @@ struct WorkerContext {
     database: PathBuf,
     settings: RwLock<Config>,
     control: Control,
+    /// Set in distributed mode.
+    remote: Option<Client>,
 }
 
 /// Runs one search thread per engine until the plan is exhausted, a stop is
@@ -175,10 +183,38 @@ pub fn run(config: &Config, engines: Vec<Engine>, options: &RunOptions, interrup
         added_spaces = added, recovered_chunks = recovered, "worker starting"
     );
 
+    let remote = match &config.coordinator.url {
+        Some(url) => {
+            let identity_dir = database.parent().unwrap_or(Path::new("."));
+            let client = Client::new(url, identity_dir, &hardware)?;
+            info!(coordinator = %client.url(), worker_id = ?client.worker_id(), "distributed mode");
+            Some(client)
+        }
+        None => None,
+    };
     let ctx = Arc::new(WorkerContext {
         database,
         settings: RwLock::new(config.clone()),
         control: Control::new(),
+        remote,
+    });
+
+    // Reports leased work; stopped only after the search threads, so it can
+    // hand over everything they committed.
+    let sync_stop = Arc::new(AtomicBool::new(false));
+    let sync = ctx.remote.is_some().then(|| {
+        let (sync_ctx, stop) = (Arc::clone(&ctx), Arc::clone(&sync_stop));
+        let release_after = Duration::from_secs(config.coordinator.release_after_pause_seconds);
+        thread::Builder::new().name("coordinator-sync".into()).spawn(move || {
+            let client = sync_ctx.remote.as_ref().expect("distributed mode");
+            let result = crate::remote::sync_loop(&sync_ctx.database, client, release_after, &|| {
+                stop.load(Ordering::SeqCst)
+            });
+            if let Err(e) = &result {
+                sync_ctx.control.stop(format!("error: {e:#}"));
+            }
+            result
+        })
     });
 
     let mut handles = Vec::with_capacity(engines.len());
@@ -228,6 +264,21 @@ pub fn run(config: &Config, engines: Vec<Engine>, options: &RunOptions, interrup
         if let Err(e) = result {
             first_error.get_or_insert(e);
         }
+    }
+    sync_stop.store(true, Ordering::SeqCst);
+    match sync {
+        Some(Ok(handle)) => {
+            if let Err(e) = handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow!("the coordinator sync thread panicked")))
+            {
+                first_error.get_or_insert(e);
+            }
+        }
+        Some(Err(e)) => {
+            first_error.get_or_insert(anyhow!("could not start the coordinator sync thread: {e}"));
+        }
+        None => {}
     }
 
     let reason = if let Some(e) = &first_error {
@@ -376,6 +427,7 @@ impl Supervisor<'_> {
                     settings.compute.clone(),
                     settings.storage.clone(),
                     settings.logging.clone(),
+                    settings.coordinator.url.clone(),
                 );
                 *settings = newer;
                 settings.compute.backend = keep.0.backend;
@@ -384,6 +436,7 @@ impl Supervisor<'_> {
                 settings.compute.kernel = keep.0.kernel;
                 settings.storage = keep.1;
                 settings.logging = keep.2;
+                settings.coordinator.url = keep.3;
                 self.last_decision = None;
                 info!(file = %path.display(), "configuration reloaded");
             }
@@ -414,8 +467,16 @@ fn search_thread(ctx: &WorkerContext, mut engine: Engine) -> Result<()> {
             let s = ctx.settings.read().unwrap();
             (s.search.clone(), s.compute.chunk_candidates)
         };
-        let Some(claim) = store.claim(&search, chunk_candidates)? else {
-            return Ok(());
+        let claim = match &ctx.remote {
+            None => match store.claim(&search, chunk_candidates)? {
+                Some(claim) => claim,
+                None => return Ok(()),
+            },
+            Some(client) => match remote_claim(ctx, &mut store, client, &engine)? {
+                Some(claim) => claim,
+                // Waited for the coordinator; check for pause or stop first.
+                None => continue,
+            },
         };
         match search_claim(ctx, &mut store, &mut engine, &hardware, claim, &mut batch) {
             Ok(()) => backoff = INITIAL_BACKOFF,
@@ -438,6 +499,50 @@ fn search_thread(ctx: &WorkerContext, mut engine: Engine) -> Result<()> {
     }
 }
 
+/// Takes leased work: a lease already held locally, else a new one from the
+/// coordinator. Returns `None` after waiting, when there is nothing to do yet.
+fn remote_claim(ctx: &WorkerContext, store: &mut Store, client: &Client, engine: &Engine) -> Result<Option<Claim>> {
+    if let Some(claim) = store.claim_leased()? {
+        return Ok(Some(claim));
+    }
+    if store.awaiting_final_report()? {
+        // The sync thread is about to report it; asking now would only get the same lease back.
+        ctx.control.sleep_unless_stopped(Duration::from_millis(250));
+        return Ok(None);
+    }
+    let measured = store.active_rate(Duration::from_secs(3600))?;
+    let rate = if measured > 0.0 {
+        measured
+    } else {
+        engine.nominal_rate()
+    };
+    let (message, wait) = match client.acquire(rate) {
+        Ok(Acquired::Lease(grant)) => {
+            if store.record_lease(&grant)? {
+                info!(chunk = %grant.chunk.id(), from = %grant.cursor, "leased a chunk from the coordinator");
+                if let Some(claim) = store.claim_leased()? {
+                    return Ok(Some(claim));
+                }
+            }
+            // A new worker holds one lease at a time, and it is already being searched.
+            (
+                "waiting for more work from the coordinator".to_string(),
+                COORDINATOR_RETRY,
+            )
+        }
+        Ok(Acquired::NoWork { retry_after }) => ("the coordinator has no work available".to_string(), retry_after),
+        Err(e) => {
+            warn!("cannot get work from the coordinator: {e:#}");
+            store.record_error(&format!("{e:#}"))?;
+            (format!("{e:#}"), COORDINATOR_RETRY)
+        }
+    };
+    *ctx.control.backoff.lock().unwrap() = Some((message, Instant::now() + wait));
+    ctx.control.sleep_unless_stopped(wait);
+    *ctx.control.backoff.lock().unwrap() = None;
+    Ok(None)
+}
+
 /// Progress on the current chunk that is computed but possibly not yet committed.
 struct Progress {
     chunk_id: String,
@@ -445,6 +550,9 @@ struct Progress {
     cursor: BigUint,
     matches: Vec<Match>,
     audits: Vec<Audit>,
+    /// Survivor set of `[committed, cursor)`, kept for leased chunks only.
+    survivors: Vec<u64>,
+    leased: bool,
     active: Duration,
     backend: &'static str,
     last_commit: Instant,
@@ -465,10 +573,12 @@ impl Progress {
             active: self.active,
             hardware,
             backend: self.backend,
+            survivors: self.leased.then_some(&self.survivors[..]),
         })?;
         self.committed = self.cursor.clone();
         self.matches.clear();
         self.audits.clear();
+        self.survivors.clear();
         self.active = Duration::ZERO;
         self.last_commit = Instant::now();
         Ok(complete)
@@ -509,6 +619,8 @@ fn search_claim_inner(
         cursor: claim.next_index,
         matches: Vec::new(),
         audits: Vec::new(),
+        survivors: Vec::new(),
+        leased: claim.leased,
         active: Duration::ZERO,
         backend: "",
         last_commit: Instant::now(),
@@ -530,6 +642,7 @@ fn search_claim_inner(
             &batch_end,
             &settings.compute,
             next_end.as_ref(),
+            progress.leased,
         )?;
         let target = Duration::from_millis(settings.compute.batch_target_ms);
         *batch = next_batch_size(output.candidates, output.elapsed, target).min(engine.max_batch());
@@ -550,6 +663,7 @@ fn search_claim_inner(
         let found = !output.matches.is_empty();
         progress.matches.extend(output.matches);
         progress.audits.extend(output.audits);
+        progress.survivors.extend(output.survivors.unwrap_or_default());
 
         let interval = Duration::from_secs(settings.compute.checkpoint_interval_seconds);
         if found || progress.cursor == end || progress.last_commit.elapsed() >= interval {
@@ -560,6 +674,10 @@ fn search_claim_inner(
             if settings.search.stop_on_first_verified_discovery {
                 ctx.control.stop("verified nontrivial discovery");
             }
+        }
+        if progress.leased && store.lease_state(&progress.chunk_id)?.as_deref() != Some("active") {
+            info!(chunk = %progress.chunk_id, "lease no longer active; stopping work on it");
+            break;
         }
     }
 

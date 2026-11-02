@@ -1,0 +1,6 @@
+# Copy to .dev.vars for `wrangler dev`: quicker reports and expiry, and room to
+# re-register while testing from one address.
+LEASE_TARGET_SECONDS = "120"
+LEASE_TTL_SECONDS = "60"
+REPORT_INTERVAL_SECONDS = "15"
+REGISTRATIONS_PER_NETWORK_PER_DAY = "1000"

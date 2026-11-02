@@ -69,3 +69,10 @@ database_path = "search.sqlite"
 
 [logging]
 level = "info"                     # (restart)
+
+[coordinator]
+# Distributed mode (docs/distributed.md): the coordinator decides what to
+# search; the settings above still decide whether to run. Unset = local only.
+# url = "https://trindrome-coordinator.example.workers.dev"   (restart)
+# A pause longer than this hands the current lease back to the coordinator.
+release_after_pause_seconds = 120

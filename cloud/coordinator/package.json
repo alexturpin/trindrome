@@ -1,0 +1,20 @@
+{
+  "name": "trindrome-coordinator",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "dev": "npm run build:wasm && wrangler dev",
+    "deploy": "npm run build:wasm && wrangler deploy",
+    "types": "wrangler types",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "wrangler": "^4.156.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "workerd@1.20261102.1": true
+  }
+}

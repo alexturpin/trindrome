@@ -41,6 +41,7 @@ fn finish(store: &mut Store, claim: &Claim) -> bool {
             active: result.elapsed,
             hardware: "test",
             backend: "test",
+            survivors: None,
         })
         .unwrap()
 }
@@ -129,6 +130,7 @@ fn interrupted_chunks_resume_from_their_committed_cursor() {
                 active: r.elapsed,
                 hardware: "test",
                 backend: "test",
+                survivors: None,
             })
             .unwrap();
         (claim.chunk.id(), half)
@@ -163,6 +165,7 @@ fn checkpoints_cannot_overstate_progress() {
             active: Duration::ZERO,
             hardware: "test",
             backend: "test",
+            survivors: None,
         })
     };
     assert!(attempt(&mut store, 0, 101, 101, &[]).is_err(), "beyond the chunk");

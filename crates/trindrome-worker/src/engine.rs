@@ -4,6 +4,9 @@
 //! rebuilds every GPU survivor from its index and checks it exactly, redoes the
 //! batch on the CPU if the survivor buffer overflowed, and periodically audits a
 //! slice of the batch against the Rust reference filter before it is committed.
+//!
+//! For chunks leased from a coordinator, a batch also yields its survivor set,
+//! the proof of search the coordinator checks (`trindrome_core::proof`).
 
 use std::time::{Duration, Instant};
 
@@ -45,6 +48,8 @@ pub struct BatchOutput {
     pub elapsed: Duration,
     pub backend: &'static str,
     pub audits: Vec<Audit>,
+    /// Absolute indices passing the decimal filter, when requested.
+    pub survivors: Option<Vec<u64>>,
 }
 
 pub fn cpu_hardware() -> String {
@@ -145,6 +150,14 @@ impl Engine {
         }
     }
 
+    /// A rough rate for the coordinator before any has been measured.
+    pub fn nominal_rate(&self) -> f64 {
+        match self {
+            Self::Cpu { .. } => 2e6,
+            Self::Cuda(_) => 5e9,
+        }
+    }
+
     pub fn max_batch(&self) -> u64 {
         match self {
             Self::Cpu { .. } => 1 << 40,
@@ -174,23 +187,38 @@ impl Engine {
         end: &BigUint,
         compute: &Compute,
         next_end: Option<&BigUint>,
+        want_survivors: bool,
     ) -> Result<BatchOutput> {
         match self {
-            Self::Cpu { .. } => cpu_batch(space, start, end),
-            Self::Cuda(engine) => engine.run_batch(space, start, end, compute, next_end),
+            Self::Cpu { .. } => cpu_batch(space, start, end, want_survivors),
+            Self::Cuda(engine) => engine.run_batch(space, start, end, compute, next_end, want_survivors),
         }
     }
 }
 
-fn cpu_batch(space: SearchSpace, start: &BigUint, end: &BigUint) -> Result<BatchOutput> {
+fn cpu_batch(space: SearchSpace, start: &BigUint, end: &BigUint, want_survivors: bool) -> Result<BatchOutput> {
+    let began = Instant::now();
     let r = search_range(space, start, end)?;
+    let survivors = want_survivors
+        .then(|| reference_survivors(space, start, end))
+        .transpose()?;
     Ok(BatchOutput {
         candidates: r.candidates_checked,
         matches: r.matches,
-        elapsed: r.elapsed,
+        elapsed: began.elapsed(),
         backend: CPU_BACKEND,
         audits: Vec::new(),
+        survivors,
     })
+}
+
+/// The survivor set of `[start, end)` from the Rust reference filter.
+fn reference_survivors(space: SearchSpace, start: &BigUint, end: &BigUint) -> Result<Vec<u64>> {
+    let filter = DecimalFilter::new(space, PRODUCTION_WINDOW)
+        .ok_or_else(|| anyhow!("{space:?} is too short for the decimal filter, so it has no survivor set"))?;
+    let start = start.to_u64().ok_or_else(|| anyhow!("index {start} exceeds 64 bits"))?;
+    let count = (end - start).to_u64().ok_or_else(|| anyhow!("batch too large"))?;
+    Ok(filter.scan(start, count)?.1)
 }
 
 /// The smallest search spaces have too few decimal digits for the GPU filter;
@@ -254,10 +282,11 @@ impl CudaEngine {
         end: &BigUint,
         compute: &Compute,
         next_end: Option<&BigUint>,
+        want_survivors: bool,
     ) -> Result<BatchOutput> {
         if !self.prepared(space)? {
             self.inflight = None;
-            return cpu_batch(space, start, end);
+            return cpu_batch(space, start, end, want_survivors);
         }
         let start64 = start
             .to_u64()
@@ -294,6 +323,11 @@ impl CudaEngine {
             result.processed
         );
 
+        let survivors = match (want_survivors, result.overflowed) {
+            (false, _) => None,
+            (true, false) => Some(result.survivors.clone()),
+            (true, true) => Some(reference_survivors(space, start, end)?),
+        };
         let matches = if result.overflowed {
             warn!(%start, %end, "GPU survivor buffer overflowed; searching the batch exactly on the CPU");
             search_range(space, start, end)?.matches
@@ -338,6 +372,7 @@ impl CudaEngine {
                 CUDA_BACKEND
             },
             audits,
+            survivors,
         })
     }
 

@@ -20,6 +20,7 @@ pub struct Config {
     pub search: Search,
     pub storage: Storage,
     pub logging: Logging,
+    pub coordinator: Coordinator,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +213,26 @@ impl Default for Logging {
     }
 }
 
+/// Distributed mode (docs/distributed.md): with a `url`, the coordinator
+/// decides what to search; the local policy still decides whether to run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Coordinator {
+    /// E.g. `"https://trindrome.example.workers.dev"`. Unset means local-only.
+    pub url: Option<String>,
+    /// A pause longer than this hands the current lease back to the coordinator.
+    pub release_after_pause_seconds: u64,
+}
+
+impl Default for Coordinator {
+    fn default() -> Self {
+        Self {
+            url: None,
+            release_after_pause_seconds: 120,
+        }
+    }
+}
+
 /// Per-user home for configuration, database and logs, shared by the CLI, the
 /// agent and any future GUI: `%LOCALAPPDATA%\Trindrome` on Windows. Overridden
 /// by `TRINDROME_HOME`.
@@ -293,6 +314,11 @@ impl Config {
         if self.logging.level.parse::<tracing::Level>().is_err() {
             bail!("logging.level must be one of trace, debug, info, warn, error");
         }
+        if let Some(url) = &self.coordinator.url
+            && !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            bail!("coordinator.url must start with https:// (or http:// for local testing)");
+        }
         Ok(())
     }
 
@@ -325,6 +351,9 @@ impl Config {
         }
         if self.logging != newer.logging {
             changed.push("logging.level");
+        }
+        if self.coordinator.url != newer.coordinator.url {
+            changed.push("coordinator.url");
         }
         changed
     }

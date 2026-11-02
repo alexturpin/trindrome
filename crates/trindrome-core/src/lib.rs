@@ -9,6 +9,7 @@
 pub mod filter;
 pub mod generator;
 pub mod palindrome;
+pub mod proof;
 pub mod verification;
 pub mod work;
 
@@ -16,6 +17,7 @@ use num_bigint::BigUint;
 use thiserror::Error;
 
 pub use generator::{Candidates, GENERATOR_VERSION, LEADING_DIGITS, MAX_HEX_DIGITS, SearchSpace};
+pub use proof::FILTER_VERSION;
 pub use verification::Verification;
 pub use work::{WORK_SCHEMA_VERSION, WorkChunk};
 
@@ -45,4 +47,7 @@ pub enum CoreError {
 
     #[error("unsupported work schema version {0} (this build supports {WORK_SCHEMA_VERSION})")]
     UnsupportedSchemaVersion(u32),
+
+    #[error("invalid survivor set: {0}")]
+    InvalidProof(String),
 }
