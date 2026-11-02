@@ -91,6 +91,39 @@ fn gpu_matches_reference_survivors_and_checksums() {
 }
 
 #[test]
+fn specialised_kernels_match_the_reference() {
+    // The checksum folds every limb of every candidate, so this checks the
+    // per-length construction as well as the filter.
+    let Some(mut gpu) = backend(4096) else { return };
+    let mut extra: Vec<(u32, u8, u64, u64)> = Vec::new();
+    for n in [15u32, 21, 34, 47, 63, 66, 72, 95, 111, 127] {
+        for l in [0x1u8, 0x3, 0x5, 0x7, 0x9, 0xF] {
+            let space = SearchSpace::new(n, l).unwrap();
+            if Prepared::new(space, PRODUCTION_WINDOW).is_err() {
+                continue; // (15, 1) is too short for the filter
+            }
+            let total = space.candidate_count();
+            let start = u64::try_from(&total / 3u32).unwrap_or(u64::MAX / 3);
+            let count = u64::try_from(total - start).map_or(COUNT, |left| left.min(COUNT));
+            extra.push((n, l, start, count));
+        }
+    }
+    for (n, l, start, count) in cases().into_iter().chain(extra) {
+        let space = SearchSpace::new(n, l).unwrap();
+        for window in [PRODUCTION_WINDOW, 1] {
+            let prepared = Prepared::specialized(space, window).unwrap();
+            let (checksum, survivors) = DecimalFilter::new(space, window).unwrap().scan(start, count).unwrap();
+            let r = gpu.search(&prepared, start, count).unwrap();
+            let label = format!("specialised ({n}, {l:X}) from {start}, window {window}");
+            assert_eq!((r.processed, r.overflowed), (count, false), "{label}");
+            assert_eq!(r.survivors, survivors, "{label}");
+            assert_eq!(r.checksum, checksum, "{label}");
+        }
+    }
+    assert!(Prepared::specialized(SearchSpace::new(129, 0x1).unwrap(), PRODUCTION_WINDOW).is_err());
+}
+
+#[test]
 fn small_windows_produce_survivors_to_compare() {
     // Guard against the comparison above being vacuous.
     let Some(mut gpu) = backend(4096) else { return };

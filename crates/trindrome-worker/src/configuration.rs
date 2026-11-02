@@ -47,6 +47,16 @@ pub struct Compute {
     pub audit_every_batches: u32,
     /// Candidates per audit slice.
     pub audit_candidates: u64,
+    /// GPU kernel family: "generic" (one kernel per integer width) or
+    /// "specialized" (one per hex length, candidates built in registers).
+    pub kernel: KernelChoice,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelChoice {
+    Generic,
+    Specialized,
 }
 
 impl Default for Compute {
@@ -62,6 +72,7 @@ impl Default for Compute {
             chunk_candidates: 1 << 36,
             audit_every_batches: 25,
             audit_candidates: 1 << 15,
+            kernel: KernelChoice::Generic,
         }
     }
 }
@@ -301,6 +312,9 @@ impl Config {
         }
         if self.compute.gpu_device != newer.compute.gpu_device {
             changed.push("compute.gpu_device");
+        }
+        if self.compute.kernel != newer.compute.kernel {
+            changed.push("compute.kernel");
         }
         if self.compute.cpu_threads != newer.compute.cpu_threads {
             changed.push("compute.cpu_threads");

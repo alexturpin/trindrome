@@ -525,35 +525,59 @@ fn benchmark_gpu(mut gpu: CudaBackend, per_case: Duration) -> Result<()> {
         gpu.device_name(),
         per_case.as_secs_f64()
     );
+    println!("  wall-clock throughput with two batches in flight; kernel: generic | specialized");
     for (n, lead, label) in cases {
         let space = SearchSpace::new(n, lead)?;
-        let prepared = Prepared::new(space, PRODUCTION_WINDOW)?;
-        let total = space.candidate_count().to_u64().unwrap_or(u64::MAX);
-        let batch = (1u64 << 30).min(total / 4);
-        let (mut start, mut done, mut survivors) = (total / 4, 0u64, 0usize);
-        let mut busy = Duration::ZERO;
-        let began = Instant::now();
-        while began.elapsed() < per_case {
-            if start + batch > total {
-                start = 0;
-            }
-            let r = gpu.search(&prepared, start, batch)?;
-            if r.processed != batch {
-                bail!("GPU processed {} of {batch} candidates", r.processed);
-            }
-            busy += r.elapsed;
-            done += batch;
-            survivors += r.survivors.len();
-            start += batch;
+        let generic = Prepared::new(space, PRODUCTION_WINDOW)?;
+        let specialized = Prepared::specialized(space, PRODUCTION_WINDOW)?;
+        let mut rates = Vec::new();
+        let mut survivors = 0;
+        for prepared in [&generic, &specialized] {
+            let (rate, found) = gpu_throughput(&mut gpu, prepared, per_case / 2)?;
+            rates.push(rate);
+            survivors += found;
         }
         println!(
-            "  {label:<20} {n:>3} hex digits ({:>2}-limb kernel): {:>8}/s, {survivors} survivors in {}",
-            prepared.limbs,
-            human(done as f64 / busy.as_secs_f64()),
-            human(done as f64)
+            "  {label:<20} {n:>3} hex digits ({:>2} limbs): {:>8}/s | {:>8}/s  ({:+.0}%), {survivors} survivors",
+            generic.limbs,
+            human(rates[0]),
+            human(rates[1]),
+            100.0 * (rates[1] / rates[0] - 1.0)
         );
     }
     Ok(())
+}
+
+/// Candidates per wall-clock second, keeping two batches in flight as the
+/// worker does, and the number of filter survivors seen.
+fn gpu_throughput(gpu: &mut CudaBackend, prepared: &Prepared, duration: Duration) -> Result<(f64, usize)> {
+    let total = prepared.space.candidate_count().to_u64().unwrap_or(u64::MAX);
+    let batch = (1u64 << 30).min(total / 4);
+    let mut start = total / 4;
+    let next = |start: &mut u64| {
+        if *start + batch > total {
+            *start = 0;
+        }
+        let s = *start;
+        *start += batch;
+        s
+    };
+    let (mut done, mut survivors) = (0u64, 0usize);
+    let began = Instant::now();
+    let mut pending = gpu.launch(prepared, next(&mut start), batch)?;
+    while began.elapsed() < duration {
+        let following = gpu.launch(prepared, next(&mut start), batch)?;
+        let r = gpu.collect(std::mem::replace(&mut pending, following))?;
+        if r.processed != batch {
+            bail!("GPU processed {} of {batch} candidates", r.processed);
+        }
+        done += batch;
+        survivors += r.survivors.len();
+    }
+    let r = gpu.collect(pending)?;
+    done += r.processed;
+    survivors += r.survivors.len();
+    Ok((done as f64 / began.elapsed().as_secs_f64(), survivors))
 }
 
 fn to_f64(v: &BigUint) -> f64 {

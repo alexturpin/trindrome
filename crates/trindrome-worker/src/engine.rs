@@ -17,7 +17,7 @@ use trindrome_core::{SearchSpace, Verification};
 use trindrome_cpu::{Match, search_range};
 use trindrome_cuda::{CudaBackend, CudaError, Pending, Prepared};
 
-use crate::configuration::{Backend, Compute};
+use crate::configuration::{Backend, Compute, KernelChoice};
 
 pub const CPU_BACKEND: &str = trindrome_cpu::IMPLEMENTATION;
 pub const CUDA_BACKEND: &str = trindrome_cuda::IMPLEMENTATION;
@@ -98,6 +98,7 @@ impl Engine {
             name: backend.device_name().to_string(),
             pci_bus_id: backend.pci_bus_id().to_string(),
             backend: Some(backend),
+            specialized: compute.kernel == KernelChoice::Specialized,
             cached: None,
             inflight: None,
             last_collected: None,
@@ -200,6 +201,7 @@ pub struct CudaEngine {
     name: String,
     pci_bus_id: String,
     backend: Option<CudaBackend>,
+    specialized: bool,
     cached: Option<(Prepared, DecimalFilter)>,
     /// The next batch, already running on the GPU.
     inflight: Option<(SearchSpace, Pending)>,
@@ -211,7 +213,12 @@ pub struct CudaEngine {
 impl CudaEngine {
     fn prepared(&mut self, space: SearchSpace) -> Result<bool> {
         if self.cached.as_ref().is_none_or(|(p, _)| p.space != space) {
-            self.cached = match Prepared::new(space, PRODUCTION_WINDOW) {
+            let prepared = if self.specialized {
+                Prepared::specialized(space, PRODUCTION_WINDOW)
+            } else {
+                Prepared::new(space, PRODUCTION_WINDOW)
+            };
+            self.cached = match prepared {
                 Ok(p) => Some((
                     p,
                     DecimalFilter::new(space, PRODUCTION_WINDOW).expect("Prepared checked this"),

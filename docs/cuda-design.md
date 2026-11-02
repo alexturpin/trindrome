@@ -76,6 +76,11 @@ Survivor checks alone cannot catch GPU false negatives. The checksum audits can,
 - At roughly 3–4×10^12 32-bit integer operations per second on the RTX 3070 Laptop, the ceiling is about 10^10 candidates/s. My guess is 2–8×10^9/s sustained, before any tuning.
 - Launch and synchronisation overhead is negligible at 200 ms batches. Host-side survivor verification is about one big-integer check per 10^9 candidates.
 
+## Later additions
+
+- **Pipelining.** The backend has two buffer slots on separate streams (`launch` and `collect`). The engine launches the next batch before collecting the current one, so survivor verification, audits, checkpoints and claims overlap the next kernel. Only collected batches with a matching processed count are ever recorded. A prefetched batch that is no longer wanted is discarded.
+- **Per-length kernels** (`compute.kernel = "specialized"`, opt-in). `search_h<n>` is compiled for each hex length from 15 to 128, so every nibble position is a compile-time constant and the candidate is built in registers. A digit is computed as `(sel & 1)·a₁ + (sel >> 1)·a₂`, which relies on each radix-4 alphabet being `{0, a₁, a₂, a₁+a₂}` (`{0,2,5,7}`, `{0,6,9,F}`), instead of a table lookup. The filter and checksum code are shared with the generic kernels. The same differential test (survivors and checksums, including every limb) covers about 70 spaces in both modes, and a deliberately swapped digit formula is caught. Adding them grows the fatbin to 6.4 MB and the kernel build to about 20 s.
+
 ## Build and distribution
 
 - `trindrome-cuda/build.rs` compiles `kernels/search.cu` with nvcc into one fatbin: `sm_86`, `sm_89` and `sm_120` machine code plus `compute_86` PTX for later GPUs. The fatbin is embedded in the binary.

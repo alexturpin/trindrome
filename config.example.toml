@@ -24,6 +24,10 @@ chunk_candidates = 68719476736
 # checksums compared before the batch is committed (0 disables).
 audit_every_batches = 25
 audit_candidates = 32768
+# GPU kernels: "generic" (one per integer width) or "specialized" (one per hex
+# length, building candidates in registers). Both are verified identical to the
+# CPU reference; compare speed with `trindrome benchmark`.   (restart)
+kernel = "generic"
 
 # When the worker may compute (`run --now` skips enabled/idle_minutes/the GPU
 # start check, but never the exclusions, power or temperature limits).

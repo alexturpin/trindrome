@@ -381,6 +381,7 @@ impl Supervisor<'_> {
                 settings.compute.backend = keep.0.backend;
                 settings.compute.gpu_device = keep.0.gpu_device;
                 settings.compute.cpu_threads = keep.0.cpu_threads;
+                settings.compute.kernel = keep.0.kernel;
                 settings.storage = keep.1;
                 settings.logging = keep.2;
                 self.last_decision = None;

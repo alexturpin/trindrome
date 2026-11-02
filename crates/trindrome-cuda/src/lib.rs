@@ -85,10 +85,33 @@ pub struct Prepared {
     pub space: SearchSpace,
     pub window: u32,
     pub limbs: usize,
+    /// Use the kernel compiled for exactly this hex length.
+    pub specialized: bool,
     params: Params,
 }
 
+/// Hex lengths with a compiled per-length kernel (`search_h<n>`).
+pub const SPECIALIZED_HEX_DIGITS: std::ops::RangeInclusive<u32> = 15..=128;
+
 impl Prepared {
+    /// Like [`Prepared::new`], but runs the kernel compiled for this exact hex
+    /// length, which builds candidates entirely in registers.
+    pub fn specialized(space: SearchSpace, window: u32) -> Result<Self, CudaError> {
+        if !SPECIALIZED_HEX_DIGITS.contains(&space.hex_digits()) {
+            return Err(CudaError::Unsupported(format!(
+                "no specialised kernel for {} hex digits",
+                space.hex_digits()
+            )));
+        }
+        let alphabet = space.alphabet();
+        // The specialised kernel computes digits as (sel & 1)·a1 + (sel >> 1)·a2.
+        assert!(alphabet.len() == 2 || alphabet[3] == alphabet[1] + alphabet[2]);
+        Ok(Self {
+            specialized: true,
+            ..Self::new(space, window)?
+        })
+    }
+
     pub fn new(space: SearchSpace, window: u32) -> Result<Self, CudaError> {
         let needed = (4 * space.hex_digits() as usize).div_ceil(32);
         let limbs_n = *LIMB_WIDTHS
@@ -117,6 +140,7 @@ impl Prepared {
             space,
             window,
             limbs: limbs_n,
+            specialized: false,
             params: Params {
                 hex_digits: space.hex_digits(),
                 leading: space.leading() as u32,
@@ -164,6 +188,8 @@ pub struct BatchResult {
 struct Kernels {
     search: Vec<(usize, CudaFunction)>,
     construct: Vec<(usize, CudaFunction)>,
+    /// `search_h<n>` for n in SPECIALIZED_HEX_DIGITS, in order.
+    specialized: Vec<CudaFunction>,
 }
 
 impl Kernels {
@@ -233,7 +259,11 @@ impl CudaBackend {
         let mut kernels = Kernels {
             search: Vec::new(),
             construct: Vec::new(),
+            specialized: Vec::new(),
         };
+        for n in SPECIALIZED_HEX_DIGITS {
+            kernels.specialized.push(module.load_function(&format!("search_h{n}"))?);
+        }
         for w in LIMB_WIDTHS {
             kernels.search.push((w, module.load_function(&format!("search_{w}"))?));
             kernels
@@ -323,7 +353,11 @@ impl CudaBackend {
             block_dim: (THREADS_PER_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
-        let func = Kernels::get(&self.kernels.search, prepared.limbs);
+        let func = if prepared.specialized {
+            &self.kernels.specialized[(prepared.space.hex_digits() - SPECIALIZED_HEX_DIGITS.start()) as usize]
+        } else {
+            Kernels::get(&self.kernels.search, prepared.limbs)
+        };
         let capacity = self.capacity;
         let slot = &mut self.slots[index];
         let stream = Arc::clone(&slot.stream);
