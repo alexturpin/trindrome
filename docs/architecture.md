@@ -45,7 +45,7 @@ A single SQLite database, in WAL mode with `synchronous = FULL`. Schema version 
 
 Indices are stored as canonical decimal strings, the same encoding the work units use.
 
-**Coverage is derived, not separately recorded.** The covered part of a space is the union of `[start_index, next_index)` over its chunks, merged in Rust. Coverage can therefore never disagree with the chunk ledger, and sparse or out-of-order completion (as future distributed workers will produce) merges naturally. `trindrome verify` checks that each space's chunks tile `[0, next_unallocated)` exactly, that every cursor lies inside its chunk, that every state matches its cursor, that every ID is canonical, and that every discovery reverifies from its index.
+**Coverage is derived, not separately recorded.** The covered part of a space is the union of `[start_index, next_index)` over its chunks, merged in Rust. Coverage can therefore never disagree with the chunk ledger, and sparse or out-of-order completion (as future distributed workers will produce) merges naturally (see [distributed.md](distributed.md)). `trindrome verify` checks that each space's chunks tile `[0, next_unallocated)` exactly, that every cursor lies inside its chunk, that every state matches its cursor, that every ID is canonical, and that every discovery reverifies from its index.
 
 ### Checkpoint rule
 

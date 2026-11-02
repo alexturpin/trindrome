@@ -2,7 +2,7 @@
 
 A GPU-accelerated search for a [number that's palindromic](https://en.wikipedia.org/wiki/Palindromic_number) in binary, decimal, and hexadecimal.
 
-Candidates come from Rick Regan's structure of binary/hexadecimal palindromes, so only the decimal property has to be tested. See [docs/algorithm.md](docs/algorithm.md) for the mathematics and [docs/architecture.md](docs/architecture.md) for the worker, its resource policy and storage. The plan lives in [spec.md](spec.md).
+Candidates come from Rick Regan's structure of binary/hexadecimal palindromes, so only the decimal property has to be tested. See [docs/algorithm.md](docs/algorithm.md) for the mathematics and [docs/architecture.md](docs/architecture.md) for the worker, its resource policy and storage. The plan lives in [spec.md](spec.md), and the design for distributing the search over Cloudflare in [docs/distributed.md](docs/distributed.md).
 
 **Status:** Phases 1–4 are done.
 
