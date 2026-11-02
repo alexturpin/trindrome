@@ -176,11 +176,42 @@ impl Kernels {
     }
 }
 
+/// One set of device buffers on its own stream, so one batch can be collected
+/// while the next is already running.
+struct Slot {
+    stream: Arc<CudaStream>,
+    survivors: CudaSlice<u32>,
+    counters: CudaSlice<u64>,
+    busy: bool,
+}
+
+/// A batch that has been launched but not yet collected.
+#[must_use = "a launched batch must be collected (or discarded by dropping the backend)"]
+#[derive(Debug)]
+pub struct Pending {
+    slot: usize,
+    start: u64,
+    count: u64,
+    launched: Instant,
+}
+
+impl Pending {
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+/// Batches that may be in flight at once.
+pub const SLOTS: usize = 2;
+
 pub struct CudaBackend {
     stream: Arc<CudaStream>,
     kernels: Kernels,
-    survivors: CudaSlice<u32>,
-    counters: CudaSlice<u64>,
+    slots: Vec<Slot>,
     capacity: u32,
     max_blocks: u32,
     name: String,
@@ -218,9 +249,18 @@ impl CudaBackend {
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID)?,
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)?
         );
+        let mut slots = Vec::with_capacity(SLOTS);
+        for _ in 0..SLOTS {
+            let slot_stream = ctx.new_stream()?;
+            slots.push(Slot {
+                survivors: slot_stream.alloc_zeros::<u32>(capacity.max(1) as usize)?,
+                counters: slot_stream.alloc_zeros::<u64>(3)?,
+                stream: slot_stream,
+                busy: false,
+            });
+        }
         Ok(Self {
-            survivors: stream.alloc_zeros::<u32>(capacity.max(1) as usize)?,
-            counters: stream.alloc_zeros::<u64>(3)?,
+            slots,
             kernels,
             capacity,
             max_blocks: sms * BLOCKS_PER_SM,
@@ -260,13 +300,23 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Filters `[start, start + count)` on the GPU. `count` may be at most 2^32.
+    /// Filters `[start, start + count)` on the GPU and waits for the result.
+    /// `count` may be at most 2^32.
     pub fn search(&mut self, prepared: &Prepared, start: u64, count: u64) -> Result<BatchResult, CudaError> {
-        Self::check_range(prepared, start, count, 1 << 32)?;
-        let began = Instant::now();
-        let stream = Arc::clone(&self.stream);
-        stream.memset_zeros(&mut self.counters)?;
+        let pending = self.launch(prepared, start, count)?;
+        self.collect(pending)
+    }
 
+    /// Starts filtering `[start, start + count)` without waiting. At most
+    /// [`SLOTS`] batches may be in flight; each must be passed to [`Self::collect`].
+    pub fn launch(&mut self, prepared: &Prepared, start: u64, count: u64) -> Result<Pending, CudaError> {
+        Self::check_range(prepared, start, count, 1 << 32)?;
+        let index = self
+            .slots
+            .iter()
+            .position(|s| !s.busy)
+            .ok_or_else(|| CudaError::Unsupported(format!("more than {SLOTS} batches in flight")))?;
+        let launched = Instant::now();
         let blocks = count.div_ceil(THREADS_PER_BLOCK as u64).min(self.max_blocks as u64) as u32;
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
@@ -274,39 +324,55 @@ impl CudaBackend {
             shared_mem_bytes: 0,
         };
         let func = Kernels::get(&self.kernels.search, prepared.limbs);
+        let capacity = self.capacity;
+        let slot = &mut self.slots[index];
+        let stream = Arc::clone(&slot.stream);
+        stream.memset_zeros(&mut slot.counters)?;
         let mut launch = stream.launch_builder(func);
         launch
             .arg(&prepared.params)
             .arg(&start)
             .arg(&count)
-            .arg(&mut self.survivors)
-            .arg(&self.capacity)
-            .arg(&mut self.counters);
+            .arg(&mut slot.survivors)
+            .arg(&capacity)
+            .arg(&mut slot.counters);
         // SAFETY: argument types and order match `search_N` in search.cu; the
         // survivor buffer holds `capacity` entries and the kernel bounds-checks.
         unsafe { launch.launch(cfg) }?;
+        slot.busy = true;
+        Ok(Pending {
+            slot: index,
+            start,
+            count,
+            launched,
+        })
+    }
 
-        let counters = stream.clone_dtoh(&self.counters)?;
+    /// Waits for a launched batch and returns what it found.
+    pub fn collect(&mut self, pending: Pending) -> Result<BatchResult, CudaError> {
+        let capacity = self.capacity as u64;
+        let slot = &mut self.slots[pending.slot];
+        slot.busy = false;
+        let counters = slot.stream.clone_dtoh(&slot.counters)?;
         let found = counters[0];
-        let overflowed = found > self.capacity as u64;
         let mut survivors: Vec<u64> = if found == 0 {
             Vec::new()
         } else {
-            let offsets = stream.clone_dtoh(&self.survivors)?;
-            offsets[..found.min(self.capacity as u64) as usize]
+            let offsets = slot.stream.clone_dtoh(&slot.survivors)?;
+            offsets[..found.min(capacity) as usize]
                 .iter()
-                .map(|&o| start + o as u64)
+                .map(|&o| pending.start + o as u64)
                 .collect()
         };
         survivors.sort_unstable();
         Ok(BatchResult {
-            start,
-            count,
+            start: pending.start,
+            count: pending.count,
             processed: counters[1],
             checksum: counters[2],
             survivors,
-            overflowed,
-            elapsed: began.elapsed(),
+            overflowed: found > capacity,
+            elapsed: pending.launched.elapsed(),
         })
     }
 

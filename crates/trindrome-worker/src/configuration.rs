@@ -57,7 +57,9 @@ impl Default for Compute {
             batch_target_ms: 200,
             checkpoint_interval_seconds: 30,
             cpu_threads: 0,
-            chunk_candidates: 1 << 30,
+            // ~15 s of GPU work: long enough for many pipelined batches per claim.
+            // Progress inside a chunk is still checkpointed by its cursor.
+            chunk_candidates: 1 << 36,
             audit_every_batches: 25,
             audit_candidates: 1 << 15,
         }

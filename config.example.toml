@@ -17,8 +17,9 @@ batch_target_ms = 200
 checkpoint_interval_seconds = 30
 # CPU search threads; 0 means half the logical processors.   (restart)
 cpu_threads = 0
-# Size of each newly allocated work chunk.
-chunk_candidates = 1073741824
+# Size of each newly allocated work chunk (~15 s of GPU work; progress inside a
+# chunk is checkpointed, so a large chunk loses nothing on a crash).
+chunk_candidates = 68719476736
 # Every Nth GPU batch, a random slice of it is recomputed on the CPU and the
 # checksums compared before the batch is committed (0 disables).
 audit_every_batches = 25

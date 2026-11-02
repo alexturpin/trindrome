@@ -119,6 +119,27 @@ fn survivor_overflow_is_detected() {
 }
 
 #[test]
+fn overlapping_batches_match_sequential_ones() {
+    let Some(mut gpu) = backend(4096) else { return };
+    let space = SearchSpace::new(33, 0x5).unwrap();
+    let prepared = Prepared::new(space, 1).unwrap();
+    let (a, b) = (1_000_000u64, 1_003_000u64);
+    let first = gpu.launch(&prepared, a, COUNT).unwrap();
+    let second = gpu.launch(&prepared, b, COUNT).unwrap();
+    assert!(gpu.launch(&prepared, 0, COUNT).is_err(), "only two slots");
+    // Collect out of order, too.
+    let r2 = gpu.collect(second).unwrap();
+    let r1 = gpu.collect(first).unwrap();
+    for (r, start) in [(r1, a), (r2, b)] {
+        let (checksum, survivors) = DecimalFilter::new(space, 1).unwrap().scan(start, COUNT).unwrap();
+        assert_eq!((r.processed, r.checksum, &r.survivors), (COUNT, checksum, &survivors));
+    }
+    // Slots are free again.
+    let again = gpu.search(&prepared, a, COUNT).unwrap();
+    assert_eq!(again.processed, COUNT);
+}
+
+#[test]
 fn invalid_batches_and_spaces_are_rejected() {
     assert!(matches!(
         Prepared::new(SearchSpace::new(15, 0x1).unwrap(), PRODUCTION_WINDOW),

@@ -516,8 +516,20 @@ fn search_claim_inner(
 
     while progress.cursor < end && ctx.control.state() == RUN {
         let settings = ctx.settings.read().unwrap().clone();
-        let batch_end = (&progress.cursor + *batch).min(end.clone());
-        let output = engine.run_batch(space, &progress.cursor, &batch_end, &settings.compute)?;
+        // A batch already running ahead on the GPU fixes this batch's end; the
+        // next one is prefetched with the current size (sizing lags one batch).
+        let batch_end = engine
+            .prefetched_end(space, &progress.cursor)
+            .unwrap_or_else(|| &progress.cursor + *batch)
+            .min(end.clone());
+        let next_end = (batch_end < end).then(|| (&batch_end + *batch).min(end.clone()));
+        let output = engine.run_batch(
+            space,
+            &progress.cursor,
+            &batch_end,
+            &settings.compute,
+            next_end.as_ref(),
+        )?;
         let target = Duration::from_millis(settings.compute.batch_target_ms);
         *batch = next_batch_size(output.candidates, output.elapsed, target).min(engine.max_batch());
         if output.backend != progress.backend && progress.cursor > progress.committed {

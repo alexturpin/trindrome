@@ -24,6 +24,45 @@ fn nvml_reads_the_cuda_device() {
 }
 
 #[test]
+fn prefetched_batches_are_used_or_discarded_correctly() {
+    use trindrome_core::SearchSpace;
+    let config = Config::default();
+    let mut engine = match Engine::cuda(&config.compute) {
+        Ok(e) => e,
+        Err(e) if std::env::var_os("TRINDROME_REQUIRE_GPU").is_some() => panic!("GPU required: {e}"),
+        Err(e) => return eprintln!("skipping GPU test: {e}"),
+    };
+    let space = SearchSpace::new(33, 0x5).unwrap();
+    let b = |v: u64| BigUint::from(v);
+    let mut compute = config.compute.clone();
+    compute.audit_every_batches = 1; // audit every batch: checks the GPU result each time
+    compute.audit_candidates = 1000;
+
+    // Batch [0, 1M) prefetches [1M, 2M).
+    let first = engine.run_batch(space, &b(0), &b(1 << 20), &compute, Some(&b(2 << 20))).unwrap();
+    assert_eq!(first.candidates, 1 << 20);
+    assert_eq!(engine.prefetched_end(space, &b(1 << 20)), Some(b(2 << 20)));
+    assert_eq!(engine.prefetched_end(space, &b(0)), None);
+
+    // Using the prefetch, and prefetching again.
+    let second = engine.run_batch(space, &b(1 << 20), &b(2 << 20), &compute, Some(&b(3 << 20))).unwrap();
+    assert_eq!((second.candidates, second.audits.len()), (1 << 20, 1));
+    assert!(second.audits[0].matched());
+
+    // A different range than the prefetch: the stale batch is discarded.
+    let other = engine.run_batch(space, &b(5 << 20), &b(6 << 20), &compute, None).unwrap();
+    assert_eq!(other.candidates, 1 << 20);
+    assert!(other.audits.iter().all(|a| a.matched() && a.start >= 5 << 20 && a.start < 6 << 20));
+    assert_eq!(engine.prefetched_end(space, &b(6 << 20)), None);
+
+    // Releasing resources drops any prefetch, and the engine reopens on demand.
+    engine.run_batch(space, &b(0), &b(1000), &compute, Some(&b(2000))).unwrap();
+    engine.release_resources();
+    assert_eq!(engine.prefetched_end(space, &b(1000)), None);
+    assert_eq!(engine.run_batch(space, &b(1000), &b(2000), &compute, None).unwrap().candidates, 1000);
+}
+
+#[test]
 fn gpu_worker_completes_a_mixed_plan_with_audits() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::default();

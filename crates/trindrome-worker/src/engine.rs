@@ -15,7 +15,7 @@ use trindrome_core::filter::{DecimalFilter, PRODUCTION_WINDOW};
 use trindrome_core::palindrome::is_decimal_palindrome;
 use trindrome_core::{SearchSpace, Verification};
 use trindrome_cpu::{Match, search_range};
-use trindrome_cuda::{CudaBackend, CudaError, Prepared};
+use trindrome_cuda::{CudaBackend, CudaError, Pending, Prepared};
 
 use crate::configuration::{Backend, Compute};
 
@@ -99,9 +99,25 @@ impl Engine {
             pci_bus_id: backend.pci_bus_id().to_string(),
             backend: Some(backend),
             cached: None,
+            inflight: None,
+            last_collected: None,
             batches: 0,
             rng: 0x9E37_79B9_7F4A_7C15 ^ crate::persistence::now_ms() as u64,
         })))
+    }
+
+    /// End of the batch already running ahead for `space` from `start`, if any.
+    /// The scheduler searches exactly that range next, so the prefetch is used.
+    pub fn prefetched_end(&self, space: SearchSpace, start: &BigUint) -> Option<BigUint> {
+        match self {
+            Self::Cuda(e) => match &e.inflight {
+                Some((s, p)) if *s == space && BigUint::from(p.start()) == *start => {
+                    Some(BigUint::from(p.start() + p.count()))
+                }
+                _ => None,
+            },
+            Self::Cpu { .. } => None,
+        }
     }
 
     pub fn hardware(&self) -> String {
@@ -135,23 +151,30 @@ impl Engine {
 
     /// Frees the CUDA context (and its VRAM) while paused; reopened on demand.
     pub fn release_resources(&mut self) {
-        if let Self::Cuda(e) = self
-            && e.backend.take().is_some()
-        {
-            tracing::debug!("released the CUDA context");
+        if let Self::Cuda(e) = self {
+            // Any prefetched batch is simply discarded: it was never recorded.
+            e.inflight = None;
+            e.last_collected = None;
+            if e.backend.take().is_some() {
+                tracing::debug!("released the CUDA context");
+            }
         }
     }
 
+    /// Searches `[start, end)`. With `next_end`, the GPU engine launches
+    /// `[end, next_end)` before collecting this batch, so the host's work on
+    /// this batch overlaps the next kernel.
     pub fn run_batch(
         &mut self,
         space: SearchSpace,
         start: &BigUint,
         end: &BigUint,
         compute: &Compute,
+        next_end: Option<&BigUint>,
     ) -> Result<BatchOutput> {
         match self {
             Self::Cpu { .. } => cpu_batch(space, start, end),
-            Self::Cuda(engine) => engine.run_batch(space, start, end, compute),
+            Self::Cuda(engine) => engine.run_batch(space, start, end, compute, next_end),
         }
     }
 }
@@ -178,6 +201,9 @@ pub struct CudaEngine {
     pci_bus_id: String,
     backend: Option<CudaBackend>,
     cached: Option<(Prepared, DecimalFilter)>,
+    /// The next batch, already running on the GPU.
+    inflight: Option<(SearchSpace, Pending)>,
+    last_collected: Option<Instant>,
     batches: u64,
     rng: u64,
 }
@@ -218,18 +244,41 @@ impl CudaEngine {
         start: &BigUint,
         end: &BigUint,
         compute: &Compute,
+        next_end: Option<&BigUint>,
     ) -> Result<BatchOutput> {
         if !self.prepared(space)? {
+            self.inflight = None;
             return cpu_batch(space, start, end);
         }
-        let began = Instant::now();
         let start64 = start
             .to_u64()
             .ok_or_else(|| anyhow!("index {start} exceeds the GPU's 64-bit range"))?;
         let count = (end - start).to_u64().ok_or_else(|| anyhow!("batch too large"))?;
-
         let prepared = self.cached.as_ref().unwrap().0.clone();
-        let result = self.backend()?.search(&prepared, start64, count)?;
+
+        // Use the prefetched batch if it is exactly this one; otherwise drop it.
+        let current = match self.inflight.take() {
+            Some((s, p)) if s == space && p.start() == start64 && p.count() == count => p,
+            Some((_, stale)) => {
+                let _ = self.backend()?.collect(stale);
+                self.backend()?.launch(&prepared, start64, count)?
+            }
+            None => self.backend()?.launch(&prepared, start64, count)?,
+        };
+        if let Some(next_end) = next_end.filter(|n| *n > end)
+            && let (Some(end64), Some(next_count)) = (end.to_u64(), (next_end - end).to_u64())
+        {
+            let next = self.backend()?.launch(&prepared, end64, next_count)?;
+            self.inflight = Some((space, next));
+        }
+        let result = self.backend()?.collect(current)?;
+        // A prefetched kernel could only start once its predecessor finished, so
+        // its GPU time runs from the later of its launch and the previous collect.
+        let gpu_time = match self.last_collected {
+            Some(previous) => result.elapsed.min(previous.elapsed()),
+            None => result.elapsed,
+        };
+        self.last_collected = Some(Instant::now());
         ensure!(
             result.processed == count,
             "GPU processed {} of {count} candidates in [{start}, {end}); refusing to record coverage",
@@ -273,7 +322,7 @@ impl CudaEngine {
         Ok(BatchOutput {
             candidates: count,
             matches,
-            elapsed: began.elapsed(),
+            elapsed: gpu_time,
             backend: CUDA_BACKEND,
             audits,
         })
