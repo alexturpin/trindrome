@@ -52,6 +52,22 @@ A full replay of Regan's 2010 coverage, lengths 2–64 for leading 1/3 and 2–3
 
   All 27 audit slices matched. This was a scratch database, so it is a demonstration rather than recorded project coverage.
 
+## Per-length kernels and pipelining (the same night)
+
+`trindrome benchmark --seconds 30 --threads 8`, run while the overnight agent was paused for a minute. The GPU was warm (62 °C at the start). The figures are wall-clock throughput with two batches in flight:
+
+| Workload | Limbs | Generic | Specialised | Gain |
+|---|---:|---:|---:|---:|
+| Historical, 32 hex digits, leading 9 | 4 | 8.12B/s | **16.09B/s** | +98 % |
+| Historical, 64 hex digits, leading 1 | 8 | 3.37B/s | **10.26B/s** | +205 % |
+| Frontier A, 65 hex digits, leading 1 | 12 | 3.11B/s | **9.35B/s** | +200 % |
+| Frontier B, 33 hex digits, leading 5 | 8 | 5.71B/s | **14.14B/s** | +148 % |
+| 128 hex digits, leading 3 | 16 | 1.68B/s | **5.78B/s** | +245 % |
+
+- **Construction was the bottleneck,** as suspected. The gain grows with the number of free digits.
+- **Overlapping alone** lifted the generic kernel by about 3–5 % over the earlier one-batch-at-a-time figures. In the worker the gain is larger, because there it hides audits, checkpoints and claims as well.
+- **Specialised kernels are now the default** (`compute.kernel = "specialized"`).
+
 ## Projections from the measured rates
 
 | Range | Candidates | At the measured rate |

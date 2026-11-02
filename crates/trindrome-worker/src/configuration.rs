@@ -72,7 +72,8 @@ impl Default for Compute {
             chunk_candidates: 1 << 36,
             audit_every_batches: 25,
             audit_candidates: 1 << 15,
-            kernel: KernelChoice::Generic,
+            // Measured 2-3.5x faster than generic on an RTX 3070 Laptop GPU.
+            kernel: KernelChoice::Specialized,
         }
     }
 }

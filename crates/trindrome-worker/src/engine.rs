@@ -21,6 +21,8 @@ use crate::configuration::{Backend, Compute, KernelChoice};
 
 pub const CPU_BACKEND: &str = trindrome_cpu::IMPLEMENTATION;
 pub const CUDA_BACKEND: &str = trindrome_cuda::IMPLEMENTATION;
+/// Coverage records which kernel family searched it.
+pub const CUDA_SPECIALIZED_BACKEND: &str = concat!("cuda-specialized/", env!("CARGO_PKG_VERSION"));
 
 /// A CPU/GPU checksum comparison over `[start, start + count)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,7 +332,11 @@ impl CudaEngine {
             candidates: count,
             matches,
             elapsed: gpu_time,
-            backend: CUDA_BACKEND,
+            backend: if prepared.specialized {
+                CUDA_SPECIALIZED_BACKEND
+            } else {
+                CUDA_BACKEND
+            },
             audits,
         })
     }
