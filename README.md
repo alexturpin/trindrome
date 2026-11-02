@@ -41,6 +41,24 @@ This starts `trindrome-agent.exe` at every login, with no console window and no 
 
 Input, a game starting, unplugging or overheating pause it within about a second. Pausing also frees its GPU memory.
 
+The agent shows a **tray icon**:
+
+| Colour | Meaning |
+|---|---|
+| Green | Computing |
+| Blue | Waiting |
+| Grey | Paused |
+| Red | Stopped with an error |
+
+Its tooltip says why, and its menu offers Pause/Resume, **Settings…**, Open data folder, Restart worker (after an error) and Quit. Settings opens `trindrome-settings.exe`, a small window for the options people change:
+
+- **When to compute:** the idle period, the GPU-quiet check, plugged-in only, overnight mode.
+- **Applications to pause for:** type a name or path, or pick from running applications.
+- **GPU temperature limits.**
+- **Start at sign-in.**
+
+It edits `trindrome.toml` in place, keeping your comments, and the agent applies the changes within seconds.
+
 ## Using it
 
 Settings live in `%LOCALAPPDATA%\Trindrome\trindrome.toml`; copy `config.example.toml` there to start. Changes apply **while it runs**, except the few `trindrome config` lists as needing a restart.

@@ -32,9 +32,11 @@ tracing-subscriber.workspace = true
 
 nvml-wrapper.workspace = true
 tracing-appender.workspace = true
+toml_edit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+tray-icon.workspace = true
 
 [dev-dependencies]
 trindrome-cuda.workspace = true

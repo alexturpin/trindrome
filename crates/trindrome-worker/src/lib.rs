@@ -10,4 +10,5 @@ pub mod policy;
 pub mod power;
 pub mod scheduler;
 pub mod sensors;
+pub mod settings_file;
 pub mod startup;

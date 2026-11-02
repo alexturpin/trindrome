@@ -6,8 +6,11 @@ trindrome-cpu      exact reference search over an index range               (dep
 trindrome-cuda     GPU exact rejection filter, kernels + cudarc host side   (depends on core)
 trindrome-worker   config, SQLite store, engines, resource policy, scheduler
   ├─ trindrome.exe        console CLI
-  └─ trindrome-agent.exe  the same worker with no console window (login startup; future tray app)
+  └─ trindrome-agent.exe  the worker on a background thread + tray icon, no console window
+trindrome-settings → trindrome-settings.exe  egui settings window (opened from the tray)
 ```
+
+The settings window is a separate process, so the always-running agent carries no GUI framework, only a tray icon and a message loop. The window never talks to the agent directly. It edits `trindrome.toml` through `settings_file.rs`, which preserves comments and other keys and validates the complete configuration before atomically replacing the file. It reads status from the database, and the agent's live reload does the rest.
 
 The mathematics knows nothing about scheduling. The resource policy only decides *whether* to run, never *what* to compute.
 

@@ -69,17 +69,31 @@ pub fn match_exclusions<'a>(processes: impl IntoIterator<Item = ProcessInfo<'a>>
     found
 }
 
-/// Excluded applications currently running, by snapshotting the process list.
+/// Distinct executable names of running processes, sorted case-insensitively
+/// (for picking applications to exclude).
 #[cfg(windows)]
-pub fn running_exclusions(patterns: &[String]) -> Result<Vec<String>, String> {
+pub fn running_process_names() -> Vec<String> {
+    let mut names: Vec<String> = snapshot()
+        .map(|p| p.into_iter().map(|(exe, _)| exe).collect())
+        .unwrap_or_default();
+    names.sort_by_key(|n| n.to_lowercase());
+    names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    names
+}
+
+#[cfg(not(windows))]
+pub fn running_process_names() -> Vec<String> {
+    Vec::new()
+}
+
+/// Executable name and process id of every running process.
+#[cfg(windows)]
+fn snapshot() -> Result<Vec<(String, u32)>, String> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
     };
 
-    if patterns.iter().all(|p| p.trim().is_empty()) {
-        return Ok(Vec::new());
-    }
     // SAFETY: plain Win32 calls; the snapshot handle is closed below.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(|e| e.to_string())?;
     let mut entry = PROCESSENTRY32W {
@@ -99,7 +113,16 @@ pub fn running_exclusions(patterns: &[String]) -> Result<Vec<String>, String> {
         ok = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
     }
     let _ = unsafe { CloseHandle(snapshot) };
+    Ok(processes)
+}
 
+/// Excluded applications currently running, by snapshotting the process list.
+#[cfg(windows)]
+pub fn running_exclusions(patterns: &[String]) -> Result<Vec<String>, String> {
+    if patterns.iter().all(|p| p.trim().is_empty()) {
+        return Ok(Vec::new());
+    }
+    let processes = snapshot()?;
     Ok(match_exclusions(
         processes.into_iter().map(|(exe, pid)| ProcessInfo {
             exe,

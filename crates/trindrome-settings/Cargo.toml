@@ -1,0 +1,15 @@
+[package]
+name = "trindrome-settings"
+description = "Settings window for Trindrome (opened from the tray)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "trindrome-settings"
+path = "src/main.rs"
+
+[dependencies]
+trindrome-worker = { path = "../trindrome-worker" }
+anyhow.workspace = true
+eframe.workspace = true
