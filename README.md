@@ -8,7 +8,7 @@ Candidates come from Rick Regan's structure of binary/hexadecimal palindromes, s
 
 - **Exact CPU reference search**, exhaustively tested.
 - **Resumable local worker** that survives crashes and kills.
-- **CUDA backend** at 3–8 billion candidates/s on an RTX 3070 Laptop GPU, with every survivor verified on the CPU ([docs/cuda-design.md](docs/cuda-design.md), [docs/benchmarks.md](docs/benchmarks.md)). A full replay of Regan's 2010 coverage (28.6 billion candidates) takes 19 seconds and finds no nontrivial triple palindrome.
+- **CUDA backend** at 6–16 billion candidates/s on an RTX 3070 Laptop GPU (per-length kernels, with batches overlapped with host work), with every survivor verified on the CPU ([docs/cuda-design.md](docs/cuda-design.md), [docs/benchmarks.md](docs/benchmarks.md)). A full replay of Regan's 2010 coverage (28.6 billion candidates) takes 19 seconds and finds no nontrivial triple palindrome.
 - **Passive Windows operation:** it computes only while you're away, pauses for games, battery power and heat, and runs as a windowless agent at login.
 
 ## Setup (Windows 11)
