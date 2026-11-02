@@ -1,0 +1,54 @@
+# Copy to trindrome.toml (next to where you run trindrome, or pass --config).
+# Every key is optional; these are the defaults. Unknown keys are rejected.
+# None of these settings can invalidate recorded coverage.
+
+[compute]
+# "auto" prefers CUDA and never silently falls back to the CPU. CUDA is not
+# implemented yet, so use "cpu" (or `trindrome run --cpu`) for now.
+backend = "auto"
+gpu_device = 0
+# Target length of one uninterruptible batch; this bounds pause latency.
+batch_target_ms = 200
+# Longest stretch of finished work held in memory before committing. Discoveries
+# and finished chunks are always committed immediately.
+checkpoint_interval_seconds = 30
+# CPU search threads; 0 means half the logical processors.
+cpu_threads = 0
+# Size of each newly allocated work chunk.
+chunk_candidates = 1073741824
+
+# Not enforced yet (Phase 4). Because idle detection is missing, `trindrome run`
+# refuses to start unless you pass --now or set enabled = false.
+[idle]
+enabled = true
+idle_minutes = 5
+gpu_start_threshold_percent = 10
+gpu_idle_sample_seconds = 30
+require_ac_power = true
+exclusive_gpu_apps = []
+
+# Not enforced yet (Phase 4). These defaults are provisional: an RTX 3070 Laptop
+# GPU commonly runs at 80-87 °C under load, so measure before relying on them.
+[thermal]
+enabled = true
+pause_temperature_c = 80
+resume_temperature_c = 72
+
+# Not enforced yet (Phase 4).
+[power]
+prevent_automatic_sleep = false
+
+[search]
+# "historical_replay" (Regan's 2010 coverage), "frontier" (beyond it), or "both".
+mode = "historical_replay"
+minimum_hex_digits = 2
+# Optional cap on hexadecimal length, for short or targeted runs.
+# maximum_hex_digits = 40
+stop_on_first_verified_discovery = true
+
+[storage]
+# Relative paths are resolved against this file's directory.
+database_path = "data/search.sqlite"
+
+[logging]
+level = "info"

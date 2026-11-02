@@ -131,7 +131,7 @@ impl SearchSpace {
 /// Completes a palindrome from its first `k + 1` digits. Odd lengths share the
 /// centre digit; even lengths repeat it.
 fn mirror(prefix: &[u8], hex_digits: u32) -> Vec<u8> {
-    let reflected = if hex_digits % 2 == 0 {
+    let reflected = if hex_digits.is_multiple_of(2) {
         prefix
     } else {
         &prefix[..prefix.len() - 1]
