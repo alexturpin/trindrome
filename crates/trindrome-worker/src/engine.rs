@@ -17,7 +17,7 @@ use trindrome_core::{SearchSpace, Verification};
 use trindrome_cpu::{Match, search_range};
 use trindrome_cuda::{CudaBackend, CudaError, Prepared};
 
-use crate::configuration::Compute;
+use crate::configuration::{Backend, Compute};
 
 pub const CPU_BACKEND: &str = trindrome_cpu::IMPLEMENTATION;
 pub const CUDA_BACKEND: &str = trindrome_cuda::IMPLEMENTATION;
@@ -50,6 +50,33 @@ pub fn cpu_hardware() -> String {
     format!("cpu:{cpu}")
 }
 
+/// Whether an error is a transient GPU/driver failure worth retrying after a
+/// back-off, as opposed to a correctness failure (audit mismatch, invariant
+/// violation) or a database error, which must stop the worker.
+pub fn is_retryable(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<CudaError>(),
+        Some(CudaError::Driver(_) | CudaError::Unavailable(_))
+    )
+}
+
+/// The engines a worker runs: one per CPU thread with `cpu`, or the GPU.
+/// `auto` and `cuda` both require the GPU and never fall back to the CPU silently.
+pub fn engines_for(compute: &Compute, cpu: bool, threads: Option<usize>) -> Result<Vec<Engine>> {
+    if cpu || compute.backend == Backend::Cpu {
+        let threads = threads.unwrap_or(compute.effective_cpu_threads()).max(1);
+        return Ok((0..threads).map(|_| Engine::cpu()).collect());
+    }
+    match Engine::cuda(compute) {
+        Ok(engine) => Ok(vec![engine]),
+        Err(e) => bail!(
+            "the CUDA backend is unavailable ({e}). compute.backend = {:?} never falls back to the CPU \
+             silently; use the CPU backend explicitly instead (`run --cpu` or compute.backend = \"cpu\").",
+            compute.backend
+        ),
+    }
+}
+
 pub enum Engine {
     Cpu { hardware: String },
     Cuda(Box<CudaEngine>),
@@ -62,12 +89,16 @@ impl Engine {
         }
     }
 
+    /// Opens the GPU now, so an unusable device is reported before starting.
     pub fn cuda(compute: &Compute) -> Result<Self, CudaError> {
+        let device = compute.gpu_device as usize;
+        let backend = CudaBackend::new(device)?;
         Ok(Self::Cuda(Box::new(CudaEngine {
-            backend: CudaBackend::new(compute.gpu_device as usize)?,
+            device,
+            name: backend.device_name().to_string(),
+            pci_bus_id: backend.pci_bus_id().to_string(),
+            backend: Some(backend),
             cached: None,
-            audit_every: compute.audit_every_batches,
-            audit_candidates: compute.audit_candidates,
             batches: 0,
             rng: 0x9E37_79B9_7F4A_7C15 ^ crate::persistence::now_ms() as u64,
         })))
@@ -76,7 +107,15 @@ impl Engine {
     pub fn hardware(&self) -> String {
         match self {
             Self::Cpu { hardware } => hardware.clone(),
-            Self::Cuda(e) => format!("gpu:{}", e.backend.device_name()),
+            Self::Cuda(e) => format!("gpu:{}", e.name),
+        }
+    }
+
+    /// The GPU's PCI address, for matching NVML telemetry; `None` for the CPU.
+    pub fn pci_bus_id(&self) -> Option<&str> {
+        match self {
+            Self::Cpu { .. } => None,
+            Self::Cuda(e) => Some(&e.pci_bus_id),
         }
     }
 
@@ -94,10 +133,25 @@ impl Engine {
         }
     }
 
-    pub fn run_batch(&mut self, space: SearchSpace, start: &BigUint, end: &BigUint) -> Result<BatchOutput> {
+    /// Frees the CUDA context (and its VRAM) while paused; reopened on demand.
+    pub fn release_resources(&mut self) {
+        if let Self::Cuda(e) = self
+            && e.backend.take().is_some()
+        {
+            tracing::debug!("released the CUDA context");
+        }
+    }
+
+    pub fn run_batch(
+        &mut self,
+        space: SearchSpace,
+        start: &BigUint,
+        end: &BigUint,
+        compute: &Compute,
+    ) -> Result<BatchOutput> {
         match self {
             Self::Cpu { .. } => cpu_batch(space, start, end),
-            Self::Cuda(engine) => engine.run_batch(space, start, end),
+            Self::Cuda(engine) => engine.run_batch(space, start, end, compute),
         }
     }
 }
@@ -119,16 +173,17 @@ fn cpu_batch(space: SearchSpace, start: &BigUint, end: &BigUint) -> Result<Batch
 const CPU_INLINE_MAX_HEX_DIGITS: u32 = 15;
 
 pub struct CudaEngine {
-    backend: CudaBackend,
+    device: usize,
+    name: String,
+    pci_bus_id: String,
+    backend: Option<CudaBackend>,
     cached: Option<(Prepared, DecimalFilter)>,
-    audit_every: u32,
-    audit_candidates: u64,
     batches: u64,
     rng: u64,
 }
 
 impl CudaEngine {
-    fn prepared(&mut self, space: SearchSpace) -> Result<Option<&(Prepared, DecimalFilter)>> {
+    fn prepared(&mut self, space: SearchSpace) -> Result<bool> {
         if self.cached.as_ref().is_none_or(|(p, _)| p.space != space) {
             self.cached = match Prepared::new(space, PRODUCTION_WINDOW) {
                 Ok(p) => Some((
@@ -139,7 +194,15 @@ impl CudaEngine {
                 Err(e) => return Err(e).context(format!("{space:?} cannot run on the GPU")),
             };
         }
-        Ok(self.cached.as_ref())
+        Ok(self.cached.is_some())
+    }
+
+    fn backend(&mut self) -> Result<&mut CudaBackend, CudaError> {
+        if self.backend.is_none() {
+            self.backend = Some(CudaBackend::new(self.device)?);
+            tracing::debug!("opened the CUDA context");
+        }
+        Ok(self.backend.as_mut().unwrap())
     }
 
     fn next_random(&mut self) -> u64 {
@@ -149,8 +212,14 @@ impl CudaEngine {
         self.rng
     }
 
-    fn run_batch(&mut self, space: SearchSpace, start: &BigUint, end: &BigUint) -> Result<BatchOutput> {
-        if self.prepared(space)?.is_none() {
+    fn run_batch(
+        &mut self,
+        space: SearchSpace,
+        start: &BigUint,
+        end: &BigUint,
+        compute: &Compute,
+    ) -> Result<BatchOutput> {
+        if !self.prepared(space)? {
             return cpu_batch(space, start, end);
         }
         let began = Instant::now();
@@ -159,8 +228,8 @@ impl CudaEngine {
             .ok_or_else(|| anyhow!("index {start} exceeds the GPU's 64-bit range"))?;
         let count = (end - start).to_u64().ok_or_else(|| anyhow!("batch too large"))?;
 
-        let (prepared, _) = self.cached.as_ref().unwrap();
-        let result = self.backend.search(prepared, start64, count)?;
+        let prepared = self.cached.as_ref().unwrap().0.clone();
+        let result = self.backend()?.search(&prepared, start64, count)?;
         ensure!(
             result.processed == count,
             "GPU processed {} of {count} candidates in [{start}, {end}); refusing to record coverage",
@@ -186,8 +255,9 @@ impl CudaEngine {
 
         self.batches += 1;
         let mut audits = Vec::new();
-        if self.audit_every > 0 && self.batches.is_multiple_of(self.audit_every as u64) {
-            let audit = self.audit(start64, count)?;
+        let every = compute.audit_every_batches as u64;
+        if every > 0 && self.batches.is_multiple_of(every) {
+            let audit = self.audit(start64, count, compute.audit_candidates)?;
             if !audit.matched() {
                 bail!(
                     "GPU audit FAILED on [{}, {}) of {space:?}: GPU checksum {:#x}, CPU {:#x}; batch not recorded",
@@ -210,11 +280,11 @@ impl CudaEngine {
     }
 
     /// Recomputes a random slice of the batch on the GPU and with the Rust filter.
-    fn audit(&mut self, start: u64, count: u64) -> Result<Audit> {
-        let len = self.audit_candidates.min(count).max(1);
+    fn audit(&mut self, start: u64, count: u64, candidates: u64) -> Result<Audit> {
+        let len = candidates.min(count).max(1);
         let offset = self.next_random() % (count - len + 1);
-        let (prepared, filter) = self.cached.as_ref().unwrap();
-        let gpu = self.backend.search(prepared, start + offset, len)?;
+        let (prepared, filter) = self.cached.clone().unwrap();
+        let gpu = self.backend()?.search(&prepared, start + offset, len)?;
         ensure!(
             gpu.processed == len,
             "GPU processed {} of {len} audit candidates",

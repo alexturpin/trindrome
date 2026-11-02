@@ -184,6 +184,7 @@ pub struct CudaBackend {
     capacity: u32,
     max_blocks: u32,
     name: String,
+    pci_bus_id: String,
 }
 
 impl CudaBackend {
@@ -210,6 +211,13 @@ impl CudaBackend {
         }
         let stream = ctx.default_stream();
         let sms = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
+        // CUDA and NVML may number devices differently; the PCI address is unambiguous.
+        let pci_bus_id = format!(
+            "{:x}:{:x}:{:x}.0",
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID)?,
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID)?,
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)?
+        );
         Ok(Self {
             survivors: stream.alloc_zeros::<u32>(capacity.max(1) as usize)?,
             counters: stream.alloc_zeros::<u64>(3)?,
@@ -217,12 +225,18 @@ impl CudaBackend {
             capacity,
             max_blocks: sms * BLOCKS_PER_SM,
             name: ctx.name()?,
+            pci_bus_id,
             stream,
         })
     }
 
     pub fn device_name(&self) -> &str {
         &self.name
+    }
+
+    /// PCI address as `domain:bus:device.function` in hex, for matching NVML telemetry.
+    pub fn pci_bus_id(&self) -> &str {
+        &self.pci_bus_id
     }
 
     fn check_range(prepared: &Prepared, start: u64, count: u64, max_count: u64) -> Result<(), CudaError> {

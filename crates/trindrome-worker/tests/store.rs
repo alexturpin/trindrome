@@ -7,7 +7,7 @@ use trindrome_cpu::{Match, search_range};
 use trindrome_worker::configuration::{Config, Search, SearchMode};
 use trindrome_worker::engine::Engine;
 use trindrome_worker::persistence::{Checkpoint, Claim, Family, Store};
-use trindrome_worker::scheduler;
+use trindrome_worker::scheduler::{self, RunOptions};
 
 fn big(v: u64) -> BigUint {
     v.into()
@@ -201,10 +201,15 @@ fn worker_runs_a_small_plan_to_completion() {
     config.search = search(SearchMode::Both, 1, Some(14));
     config.compute.chunk_candidates = 5000;
     config.compute.batch_target_ms = 5;
+    config.idle.require_ac_power = false;
 
     let reason = scheduler::run(
         &config,
         (0..3).map(|_| Engine::cpu()).collect(),
+        &RunOptions {
+            immediate: true,
+            ..Default::default()
+        },
         &AtomicBool::new(false),
     )
     .unwrap();

@@ -7,7 +7,21 @@ use num_bigint::BigUint;
 use trindrome_worker::configuration::{Config, Search, SearchMode};
 use trindrome_worker::engine::Engine;
 use trindrome_worker::persistence::Store;
-use trindrome_worker::scheduler;
+use trindrome_worker::scheduler::{self, RunOptions};
+
+#[test]
+fn nvml_reads_the_cuda_device() {
+    let backend = match trindrome_cuda::CudaBackend::new(0) {
+        Ok(b) => b,
+        Err(e) if std::env::var_os("TRINDROME_REQUIRE_GPU").is_some() => panic!("GPU required: {e}"),
+        Err(e) => return eprintln!("skipping GPU test: {e}"),
+    };
+    let monitor = trindrome_worker::gpu_monitor::GpuMonitor::new(backend.pci_bus_id()).unwrap();
+    let reading = monitor.read().unwrap();
+    eprintln!("{} at {}: {reading:?}", backend.device_name(), backend.pci_bus_id());
+    assert!((1..110).contains(&reading.temperature_c));
+    assert!(reading.utilization_percent <= 100);
+}
 
 #[test]
 fn gpu_worker_completes_a_mixed_plan_with_audits() {
@@ -24,13 +38,23 @@ fn gpu_worker_completes_a_mixed_plan_with_audits() {
     config.compute.chunk_candidates = 1 << 26;
     config.compute.audit_every_batches = 2;
     config.compute.audit_candidates = 2000;
+    config.idle.require_ac_power = false;
 
     let engine = match Engine::cuda(&config.compute) {
         Ok(e) => e,
         Err(e) if std::env::var_os("TRINDROME_REQUIRE_GPU").is_some() => panic!("GPU required: {e}"),
         Err(e) => return eprintln!("skipping GPU test: {e}"),
     };
-    let reason = scheduler::run(&config, vec![engine], &AtomicBool::new(false)).unwrap();
+    let reason = scheduler::run(
+        &config,
+        vec![engine],
+        &RunOptions {
+            immediate: true,
+            ..Default::default()
+        },
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(reason, "search plan exhausted");
 
     let store = Store::open(&config.storage.database_path).unwrap();

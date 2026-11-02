@@ -156,7 +156,9 @@ pub struct Search {
 impl Default for Search {
     fn default() -> Self {
         Self {
-            mode: SearchMode::HistoricalReplay,
+            // The replay takes seconds on a GPU; an always-on worker should go on
+            // to the frontier rather than stop. (The spec suggested replay only.)
+            mode: SearchMode::Both,
             minimum_hex_digits: 2,
             maximum_hex_digits: None,
             stop_on_first_verified_discovery: true,
@@ -179,7 +181,7 @@ pub struct Storage {
 impl Default for Storage {
     fn default() -> Self {
         Self {
-            database_path: PathBuf::from("data/search.sqlite"),
+            database_path: PathBuf::from("search.sqlite"),
         }
     }
 }
@@ -196,15 +198,45 @@ impl Default for Logging {
     }
 }
 
+/// Per-user home for configuration, database and logs, shared by the CLI, the
+/// agent and any future GUI: `%LOCALAPPDATA%\Trindrome` on Windows. Overridden
+/// by `TRINDROME_HOME`.
+pub fn data_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("TRINDROME_HOME") {
+        return PathBuf::from(home);
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        return Path::new(&local).join("Trindrome");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Path::new(&home).join(".local/share/trindrome");
+    }
+    PathBuf::from(".")
+}
+
+/// Which file a configuration comes from: `--config`, then `TRINDROME_CONFIG`,
+/// then `trindrome.toml` in [`data_dir`]. Only the last may be absent.
+pub fn config_path(explicit: Option<&Path>) -> (PathBuf, bool) {
+    match explicit {
+        Some(p) => (p.to_path_buf(), true),
+        None => match std::env::var_os("TRINDROME_CONFIG") {
+            Some(p) => (PathBuf::from(p), true),
+            None => (data_dir().join(DEFAULT_CONFIG_FILE), false),
+        },
+    }
+}
+
 impl Config {
-    /// Loads `path`, or the default file if it exists, or built-in defaults.
-    ///
-    /// A relative database path is resolved against the config file's directory.
-    pub fn load(path: Option<&Path>) -> Result<Self> {
-        let (path, required) = match path {
-            Some(p) => (p.to_path_buf(), true),
-            None => (PathBuf::from(DEFAULT_CONFIG_FILE), false),
-        };
+    /// Loads the configuration chosen by [`config_path`], or built-in defaults if
+    /// the default file does not exist. A relative database path is resolved
+    /// against the configuration file's directory.
+    pub fn load(explicit: Option<&Path>) -> Result<Self> {
+        let (path, required) = config_path(explicit);
+        Self::load_from(&path, required)
+    }
+
+    pub fn load_from(path: &Path, required: bool) -> Result<Self> {
+        let path = path.to_path_buf();
         let mut config = match std::fs::read_to_string(&path) {
             Ok(text) => {
                 toml::from_str::<Config>(&text).with_context(|| format!("invalid config {}", path.display()))?
@@ -250,16 +282,34 @@ impl Config {
         Ok(())
     }
 
-    /// Settings that parse but are not enforced by this build yet.
+    /// Settings that parse but cannot be enforced on this platform.
     pub fn unenforced_settings(&self) -> Vec<&'static str> {
-        let mut unenforced = vec!["[idle] (idle detection arrives in Phase 4)"];
-        if self.thermal.enabled {
-            unenforced.push("[thermal] (GPU telemetry arrives in Phase 4)");
+        if cfg!(windows) {
+            Vec::new()
+        } else {
+            vec!["[idle] and [power] (implemented for Windows only)"]
         }
-        if self.power.prevent_automatic_sleep {
-            unenforced.push("power.prevent_automatic_sleep (arrives in Phase 4)");
+    }
+
+    /// Settings whose change only takes effect after a restart.
+    pub fn restart_required_changes(&self, newer: &Config) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.compute.backend != newer.compute.backend {
+            changed.push("compute.backend");
         }
-        unenforced
+        if self.compute.gpu_device != newer.compute.gpu_device {
+            changed.push("compute.gpu_device");
+        }
+        if self.compute.cpu_threads != newer.compute.cpu_threads {
+            changed.push("compute.cpu_threads");
+        }
+        if self.storage != newer.storage {
+            changed.push("storage.database_path");
+        }
+        if self.logging != newer.logging {
+            changed.push("logging.level");
+        }
+        changed
     }
 }
 
@@ -293,12 +343,12 @@ mod tests {
             prevent_automatic_sleep = false
 
             [search]
-            mode = "historical_replay"
+            mode = "both"
             minimum_hex_digits = 2
             stop_on_first_verified_discovery = true
 
             [storage]
-            database_path = "data/search.sqlite"
+            database_path = "search.sqlite"
 
             [logging]
             level = "info"

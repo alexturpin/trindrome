@@ -1,19 +1,21 @@
-# Copy to trindrome.toml (next to where you run trindrome, or pass --config).
-# Every key is optional; these are the defaults. Unknown keys are rejected.
-# None of these settings can invalidate recorded coverage.
+# Copy to %LOCALAPPDATA%\Trindrome\trindrome.toml (or pass --config / set
+# TRINDROME_CONFIG). Every key is optional; these are the defaults. Unknown keys
+# are rejected. A running worker reloads this file when it changes; the settings
+# marked "restart" only take effect after a restart. No setting here can
+# invalidate recorded coverage.
 
 [compute]
 # "auto" and "cuda" use the GPU and never silently fall back to the CPU (spaces
 # under about 15 hex digits, ~4M candidates in all, are always done on the CPU).
-# "cpu" (or `trindrome run --cpu`) uses the exact CPU reference.
+# "cpu" (or `trindrome run --cpu`) uses the exact CPU reference.   (restart)
 backend = "auto"
-gpu_device = 0
+gpu_device = 0                     # (restart)
 # Target length of one uninterruptible batch; this bounds pause latency.
 batch_target_ms = 200
 # Longest stretch of finished work held in memory before committing. Discoveries
 # and finished chunks are always committed immediately.
 checkpoint_interval_seconds = 30
-# CPU search threads; 0 means half the logical processors.
+# CPU search threads; 0 means half the logical processors.   (restart)
 cpu_threads = 0
 # Size of each newly allocated work chunk.
 chunk_candidates = 1073741824
@@ -22,39 +24,43 @@ chunk_candidates = 1073741824
 audit_every_batches = 25
 audit_candidates = 32768
 
-# Not enforced yet (Phase 4). Because idle detection is missing, `trindrome run`
-# refuses to start unless you pass --now or set enabled = false.
+# When the worker may compute (`run --now` skips enabled/idle_minutes/the GPU
+# start check, but never the exclusions, power or temperature limits).
 [idle]
 enabled = true
+# Keyboard and mouse idle this long before starting; any input pauses at once.
 idle_minutes = 5
+# Before starting on the GPU, its utilization averaged over this many seconds
+# must be below this threshold (ignored once running: our own load raises it).
 gpu_start_threshold_percent = 10
 gpu_idle_sample_seconds = 30
 require_ac_power = true
+# Pause whenever any of these is running, in the foreground or not. Use file
+# names ("game.exe", any case) or full paths ('C:\Games\Foo\game.exe').
 exclusive_gpu_apps = []
 
-# Not enforced yet (Phase 4); until then only the GPU's own thermal protection
-# applies. These defaults are provisional: an RTX 3070 Laptop
-# GPU commonly runs at 80-87 °C under load, so measure before relying on them.
 [thermal]
 enabled = true
 pause_temperature_c = 80
 resume_temperature_c = 72
 
-# Not enforced yet (Phase 4).
 [power]
+# Overnight mode: while computing on AC power, keep Windows from going to sleep
+# on its own. Never blocks sleeping on request, shutdown or lid close, and
+# never keeps the display on.
 prevent_automatic_sleep = false
 
 [search]
-# "historical_replay" (Regan's 2010 coverage), "frontier" (beyond it), or "both".
-mode = "historical_replay"
+# "both" (Regan's 2010 coverage, then beyond it), "historical_replay", or "frontier".
+mode = "both"
 minimum_hex_digits = 2
 # Optional cap on hexadecimal length, for short or targeted runs.
 # maximum_hex_digits = 40
 stop_on_first_verified_discovery = true
 
 [storage]
-# Relative paths are resolved against this file's directory.
-database_path = "data/search.sqlite"
+# Relative paths are resolved against this file's directory.   (restart)
+database_path = "search.sqlite"
 
 [logging]
-level = "info"
+level = "info"                     # (restart)

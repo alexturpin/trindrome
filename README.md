@@ -2,19 +2,20 @@
 
 A GPU-accelerated search for a [number that's palindromic](https://en.wikipedia.org/wiki/Palindromic_number) in binary, decimal, and hexadecimal.
 
-Candidates come from Rick Regan's structure of binary/hexadecimal palindromes, so only the decimal property has to be tested. See [docs/algorithm.md](docs/algorithm.md) for the mathematics and [docs/architecture.md](docs/architecture.md) for how the worker stores progress. The plan lives in [spec.md](spec.md).
+Candidates come from Rick Regan's structure of binary/hexadecimal palindromes, so only the decimal property has to be tested. See [docs/algorithm.md](docs/algorithm.md) for the mathematics and [docs/architecture.md](docs/architecture.md) for the worker, its resource policy and storage. The plan lives in [spec.md](spec.md).
 
-**Status:** Phases 1–3 are done: an exact, exhaustively tested CPU search, a resumable local worker, and a CUDA backend.
+**Status:** Phases 1–4 are done.
 
-- **CUDA backend.** It runs an exact GPU rejection filter, and every survivor is verified on the CPU. It handles 3–8 billion candidates/s on an RTX 3070 Laptop GPU ([docs/cuda-design.md](docs/cuda-design.md), [docs/benchmarks.md](docs/benchmarks.md)).
-- **Historical replay.** A full replay of Regan's 2010 coverage, 28.6 billion candidates, takes 19 seconds and finds no nontrivial triple palindrome.
-- **Next:** Windows idle scheduling (Phase 4).
+- **Exact CPU reference search**, exhaustively tested.
+- **Resumable local worker** that survives crashes and kills.
+- **CUDA backend** at 3–8 billion candidates/s on an RTX 3070 Laptop GPU, with every survivor verified on the CPU ([docs/cuda-design.md](docs/cuda-design.md), [docs/benchmarks.md](docs/benchmarks.md)). A full replay of Regan's 2010 coverage (28.6 billion candidates) takes 19 seconds and finds no nontrivial triple palindrome.
+- **Passive Windows operation:** it computes only while you're away, pauses for games, battery power and heat, and runs as a windowless agent at login.
 
 ## Setup (Windows 11)
 
 - Rust stable with the MSVC toolchain (`winget install Rustlang.Rustup`)
-- Visual Studio Build Tools with the C++ workload (needed by Rust, by the bundled SQLite and later by nvcc)
-- From Phase 3 onwards: the CUDA Toolkit 13.x. Use a custom install and leave out the bundled driver.
+- Visual Studio Build Tools with the C++ workload (needed by Rust, the bundled SQLite and nvcc)
+- The CUDA Toolkit 13.x, to build the GPU kernels. Use a custom install and leave out the bundled driver.
 
 ```bash
 cargo test --workspace
@@ -24,27 +25,38 @@ cargo test --workspace
 cargo build --release
 ```
 
-## Usage
+Running needs only the NVIDIA driver. A build made without the CUDA Toolkit still works with `--cpu` and reports CUDA as unavailable.
+
+## Running it in the background
 
 ```bash
-target/release/trindrome run --now
+target/release/trindrome startup enable
 ```
 
-This runs on the GPU. Add `--cpu` to use the CPU reference instead. Building needs the CUDA Toolkit; running needs only the NVIDIA driver. A build made without the toolkit still runs on the CPU and reports CUDA as unavailable.
+This starts `trindrome-agent.exe` at every login, with no console window and no administrator rights. It appears as "Trindrome" in Task Manager → Startup apps. Start it now by running `trindrome-agent.exe` once. It computes on the GPU only while:
 
-Copy `config.example.toml` to `trindrome.toml` to change defaults. While a worker runs, use these commands from another terminal:
+- the keyboard and mouse have been idle for `idle_minutes` (default 5), and the GPU was otherwise quiet;
+- no application in `exclusive_gpu_apps` is running (add your games; controllers aren't seen by idle detection);
+- the laptop is on AC power, and the GPU is below `pause_temperature_c`.
+
+Input, a game starting, unplugging or overheating pause it within about a second. Pausing also frees its GPU memory.
+
+## Using it
+
+Settings live in `%LOCALAPPDATA%\Trindrome\trindrome.toml`; copy `config.example.toml` there to start. Changes apply **while it runs**, except the few `trindrome config` lists as needing a restart.
 
 | Command | Does |
 |---|---|
-| `trindrome status` | Worker state, throughput, historical and frontier progress, ETA, active chunks |
-| `trindrome pause` / `resume` | Pause after the current batch, which releases its chunks, and resume later |
-| `trindrome stop` | Checkpoint and exit (Ctrl+C in the worker's terminal does the same) |
+| `trindrome status [--json]` | State and *why* (e.g. "waiting for the computer to be idle (3:10 of 5:00)"), throughput, progress, ETA |
+| `trindrome run [--now] [--cpu]` | Run the worker in this terminal. `--now` skips the inactivity requirements; game, battery and temperature limits still apply |
+| `trindrome pause` / `resume` / `stop` | Control whichever worker is running, agent or terminal |
 | `trindrome coverage [--all]` | Searched index ranges per search space, coverage by backend, GPU audits |
-| `trindrome discoveries` | Verified matches (the trivial 1, 3, 5, 7 and 9 only appear with `minimum_hex_digits = 1`) |
+| `trindrome discoveries` | Verified matches |
 | `trindrome verify` | Checks the database for gaps, overlaps and unverifiable discoveries |
 | `trindrome benchmark` | GPU and CPU throughput on historical and frontier workloads (no database) |
-| `trindrome config` | Prints the effective configuration |
+| `trindrome config` | Effective configuration and where its files are |
+| `trindrome startup enable` / `disable` / `status` | Start the agent at login |
 
-Progress survives Ctrl+C, forced termination and crashes. At worst, the last uncommitted batches are searched again.
+Progress survives Ctrl+C, forced termination, crashes, sleep and logoff. At worst, the last uncommitted batches are searched again. The agent logs to `%LOCALAPPDATA%\Trindrome\logs`.
 
 The "frontiers" here are lengths beyond Regan's published 2010 coverage, not necessarily beyond all later work.

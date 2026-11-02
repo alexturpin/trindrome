@@ -2,27 +2,38 @@
 //!
 //! Each search thread owns one [`Engine`] and its own database connection and
 //! claims chunks in `BEGIN IMMEDIATE` transactions, so threads coordinate through
-//! SQLite exactly as independent processes (or, later, machines) would. The main
-//! thread only relays control requests and writes heartbeats.
+//! SQLite exactly as independent processes (or, later, machines) would.
+//!
+//! The main thread is the supervisor: every second it reads the sensors, asks the
+//! [`Policy`] whether computing is allowed, combines that with manual pause/stop
+//! requests and error back-off, reloads the configuration file if it changed,
+//! and records the state and its reason for the CLI and front ends.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use trindrome_cpu::Match;
 
-use crate::configuration::{Config, Search};
-use crate::engine::{Audit, Engine};
+use crate::configuration::Config;
+use crate::engine::{Audit, Engine, is_retryable};
 use crate::persistence::{Checkpoint, Claim, Requested, Store};
+use crate::policy::{Decision, Policy, PolicySettings, Reason};
+use crate::power;
+use crate::sensors::SystemSensors;
 
 const CONTROL_POLL: Duration = Duration::from_millis(250);
+const POLICY_INTERVAL: Duration = Duration::from_secs(1);
+const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+const INITIAL_BACKOFF: Duration = Duration::from_secs(15);
+const MAX_BACKOFF: Duration = Duration::from_secs(600);
 
 /// Exclusive ownership of a database by one worker process.
 pub struct InstanceLock {
@@ -67,14 +78,23 @@ const RUN: u8 = 0;
 const PAUSE: u8 = 1;
 const STOP: u8 = 2;
 
-#[derive(Default)]
 struct Control {
     desired: AtomicU8,
     stop_reason: Mutex<Option<String>>,
-    discovered: AtomicBool,
+    /// A search thread backing off after a transient error: message and retry time.
+    backoff: Mutex<Option<(String, Instant)>>,
 }
 
 impl Control {
+    /// Starts paused: nothing runs until the policy has been consulted.
+    fn new() -> Self {
+        Self {
+            desired: AtomicU8::new(PAUSE),
+            stop_reason: Mutex::new(None),
+            backoff: Mutex::new(None),
+        }
+    }
+
     fn stop(&self, reason: impl Into<String>) {
         let mut current = self.stop_reason.lock().unwrap();
         current.get_or_insert_with(|| reason.into());
@@ -103,36 +123,62 @@ impl Control {
             }
         }
     }
+
+    /// Sleeps for `duration` unless stopped first. Returns false on stop.
+    fn sleep_unless_stopped(&self, duration: Duration) -> bool {
+        let until = Instant::now() + duration;
+        while Instant::now() < until {
+            if self.state() == STOP {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        self.state() != STOP
+    }
+}
+
+/// How the worker was started.
+#[derive(Clone, Debug, Default)]
+pub struct RunOptions {
+    /// `run --now`: skip the inactivity requirements, keep every safety limit.
+    pub immediate: bool,
+    /// Configuration file to watch for changes, and whether it must exist.
+    pub config_file: Option<(PathBuf, bool)>,
 }
 
 struct WorkerContext {
     database: PathBuf,
-    search: Search,
-    chunk_candidates: u64,
-    batch_target: Duration,
-    checkpoint_interval: Duration,
+    settings: RwLock<Config>,
     control: Control,
 }
 
 /// Runs one search thread per engine until the plan is exhausted, a stop is
 /// requested, or `interrupted` becomes true. Returns the reason it stopped.
-pub fn run(config: &Config, engines: Vec<Engine>, interrupted: &AtomicBool) -> Result<String> {
+pub fn run(config: &Config, engines: Vec<Engine>, options: &RunOptions, interrupted: &AtomicBool) -> Result<String> {
     let database = config.storage.database_path.clone();
     let _lock = acquire_lock(&database)?;
     let mut store = Store::open(&database)?;
     let added = store.plan(&config.search)?;
     let recovered = store.recover_interrupted()?;
     store.worker_started()?;
+
     let hardware = engines.first().map(Engine::hardware).unwrap_or_default();
-    info!(database = %database.display(), threads = engines.len(), %hardware, added_spaces = added, recovered_chunks = recovered, "worker starting");
+    let pci_bus_id = engines.iter().find_map(|e| e.pci_bus_id().map(str::to_string));
+    let uses_gpu = pci_bus_id.is_some();
+    let sensors = SystemSensors::new(config.idle.exclusive_gpu_apps.clone(), pci_bus_id.as_deref());
+    if let Some(e) = sensors.gpu_error() {
+        warn!("GPU telemetry unavailable: {e}");
+    }
+    let policy = Policy::new(PolicySettings::from_config(config, uses_gpu, options.immediate));
+    info!(
+        database = %database.display(), threads = engines.len(), %hardware, immediate = options.immediate,
+        added_spaces = added, recovered_chunks = recovered, "worker starting"
+    );
 
     let ctx = Arc::new(WorkerContext {
         database,
-        search: config.search.clone(),
-        chunk_candidates: config.compute.chunk_candidates,
-        batch_target: Duration::from_millis(config.compute.batch_target_ms),
-        checkpoint_interval: Duration::from_secs(config.compute.checkpoint_interval_seconds),
-        control: Control::default(),
+        settings: RwLock::new(config.clone()),
+        control: Control::new(),
     });
 
     let mut handles = Vec::with_capacity(engines.len());
@@ -155,12 +201,26 @@ pub fn run(config: &Config, engines: Vec<Engine>, interrupted: &AtomicBool) -> R
         }
     }
 
-    let monitor = monitor(&store, &ctx, &handles, interrupted);
-    if monitor.is_err() {
+    let mut supervisor = Supervisor {
+        store: &store,
+        ctx: &ctx,
+        sensors,
+        policy,
+        uses_gpu,
+        options,
+        config_stamp: options.config_file.as_ref().and_then(|(p, _)| modified(p)),
+        last_config_check: Instant::now(),
+        last_decision: None,
+        awake: false,
+        logged: String::new(),
+    };
+    let supervised = supervisor.run(&handles, interrupted);
+    power::keep_system_awake(false);
+    if supervised.is_err() {
         ctx.control.stop("control loop failed");
     }
 
-    let mut first_error = monitor.err();
+    let mut first_error = supervised.err();
     for handle in handles {
         let result = handle
             .join()
@@ -186,51 +246,195 @@ pub fn run(config: &Config, engines: Vec<Engine>, interrupted: &AtomicBool) -> R
     }
 }
 
-fn monitor(
-    store: &Store,
-    ctx: &WorkerContext,
-    handles: &[thread::JoinHandle<Result<()>>],
-    interrupted: &AtomicBool,
-) -> Result<()> {
-    let mut last_state = "";
-    while !handles.iter().all(|h| h.is_finished()) {
-        if interrupted.load(Ordering::SeqCst) {
-            ctx.control.stop("interrupted");
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+struct Supervisor<'a> {
+    store: &'a Store,
+    ctx: &'a WorkerContext,
+    sensors: SystemSensors,
+    policy: Policy,
+    uses_gpu: bool,
+    options: &'a RunOptions,
+    config_stamp: Option<SystemTime>,
+    last_config_check: Instant,
+    last_decision: Option<(Instant, Decision)>,
+    awake: bool,
+    logged: String,
+}
+
+impl Supervisor<'_> {
+    fn run(&mut self, handles: &[thread::JoinHandle<Result<()>>], interrupted: &AtomicBool) -> Result<()> {
+        while !handles.iter().all(|h| h.is_finished()) {
+            self.tick(interrupted)?;
+            thread::sleep(CONTROL_POLL);
         }
-        match store.requested()? {
-            Requested::Run => ctx.control.set_paused(false),
-            Requested::Pause => ctx.control.set_paused(true),
-            Requested::Stop => ctx.control.stop("stop requested"),
-        }
-        let (state, reason) = match ctx.control.state() {
-            RUN => ("running", None),
-            PAUSE => ("paused", Some("manual pause")),
-            _ => (
-                "stopping",
-                ctx.control.stop_reason.lock().unwrap().clone().map(|_| "stopping"),
-            ),
-        };
-        if state != last_state {
-            info!(state, "worker state");
-            last_state = state;
-        }
-        store.heartbeat(state, reason)?;
-        thread::sleep(CONTROL_POLL);
+        Ok(())
     }
-    Ok(())
+
+    fn tick(&mut self, interrupted: &AtomicBool) -> Result<()> {
+        let control = &self.ctx.control;
+        if interrupted.load(Ordering::SeqCst) {
+            control.stop("interrupted");
+        }
+        let requested = self.store.requested()?;
+        if requested == Requested::Stop {
+            control.stop("stop requested");
+        }
+        if self.last_config_check.elapsed() >= CONFIG_CHECK_INTERVAL {
+            self.last_config_check = Instant::now();
+            self.reload_config_if_changed();
+        }
+        let due = self
+            .last_decision
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= POLICY_INTERVAL);
+        if due {
+            let readings = self.sensors.read();
+            self.last_decision = Some((Instant::now(), self.policy.evaluate(&readings)));
+        }
+        let decision = self.last_decision.as_ref().unwrap().1.clone();
+
+        // Precedence: stop, manual pause, error back-off, then the policy.
+        let backoff = control.backoff.lock().unwrap().clone();
+        let (state, reason) = if control.state() == STOP {
+            ("stopping", None)
+        } else if requested == Requested::Pause {
+            ("paused", Some(Reason::ManualPause))
+        } else if let Some((message, until)) = backoff {
+            let retry_in_seconds = until.saturating_duration_since(Instant::now()).as_secs();
+            (
+                "error",
+                Some(Reason::Error {
+                    message,
+                    retry_in_seconds,
+                }),
+            )
+        } else if !decision.run {
+            ("waiting", Some(decision.reason))
+        } else {
+            ("running", Some(Reason::Running))
+        };
+        control.set_paused(state != "running");
+
+        // Overnight mode: hold off idle sleep only while computing on AC power.
+        let settings = self.ctx.settings.read().unwrap();
+        let awake = state == "running" && settings.power.prevent_automatic_sleep && power::on_ac_power() == Some(true);
+        drop(settings);
+        if awake != self.awake {
+            power::keep_system_awake(awake);
+            self.awake = awake;
+        }
+
+        let text = match &reason {
+            Some(r) => r.describe(),
+            None => control.stop_reason.lock().unwrap().clone().unwrap_or_default(),
+        };
+        let code = reason.as_ref().map(Reason::code);
+        let summary = format!("{state}: {}", code.unwrap_or(""));
+        if summary != self.logged {
+            info!(state, reason = %text, "worker state");
+            self.logged = summary;
+        }
+        let detail = reason.as_ref().map(Reason::detail_json);
+        self.store.heartbeat(state, Some(&text), code, detail.as_deref())?;
+        Ok(())
+    }
+
+    /// Applies a changed configuration file without restarting. Invalid files
+    /// are reported and ignored; settings that need a restart are reported.
+    fn reload_config_if_changed(&mut self) {
+        let Some((path, required)) = &self.options.config_file else {
+            return;
+        };
+        let stamp = modified(path);
+        if stamp == self.config_stamp {
+            return;
+        }
+        self.config_stamp = stamp;
+        if stamp.is_none() && !required {
+            return;
+        }
+        match Config::load_from(path, *required) {
+            Ok(newer) => {
+                let mut settings = self.ctx.settings.write().unwrap();
+                for setting in settings.restart_required_changes(&newer) {
+                    warn!(
+                        setting,
+                        "changed in the configuration file; takes effect after a restart"
+                    );
+                }
+                self.policy.update_settings(PolicySettings::from_config(
+                    &newer,
+                    self.uses_gpu,
+                    self.options.immediate,
+                ));
+                self.sensors.set_exclusions(newer.idle.exclusive_gpu_apps.clone());
+                // Keep restart-only settings as they are until a restart.
+                let keep = (
+                    settings.compute.clone(),
+                    settings.storage.clone(),
+                    settings.logging.clone(),
+                );
+                *settings = newer;
+                settings.compute.backend = keep.0.backend;
+                settings.compute.gpu_device = keep.0.gpu_device;
+                settings.compute.cpu_threads = keep.0.cpu_threads;
+                settings.storage = keep.1;
+                settings.logging = keep.2;
+                self.last_decision = None;
+                info!(file = %path.display(), "configuration reloaded");
+            }
+            Err(e) => {
+                error!("ignoring invalid configuration change: {e:#}");
+                let _ = self
+                    .store
+                    .record_error(&format!("invalid configuration change ignored: {e:#}"));
+            }
+        }
+    }
 }
 
 fn search_thread(ctx: &WorkerContext, mut engine: Engine) -> Result<()> {
     let mut store = Store::open(&ctx.database)?;
     let hardware = engine.hardware();
     let mut batch = engine.initial_batch();
-    while ctx.control.wait_until_runnable() {
-        let Some(claim) = store.claim(&ctx.search, ctx.chunk_candidates)? else {
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        if ctx.control.state() != RUN {
+            // Give the GPU's memory back while paused (e.g. to a game).
+            engine.release_resources();
+            if !ctx.control.wait_until_runnable() {
+                return Ok(());
+            }
+        }
+        let (search, chunk_candidates) = {
+            let s = ctx.settings.read().unwrap();
+            (s.search.clone(), s.compute.chunk_candidates)
+        };
+        let Some(claim) = store.claim(&search, chunk_candidates)? else {
             return Ok(());
         };
-        search_claim(ctx, &mut store, &mut engine, &hardware, claim, &mut batch)?;
+        match search_claim(ctx, &mut store, &mut engine, &hardware, claim, &mut batch) {
+            Ok(()) => backoff = INITIAL_BACKOFF,
+            Err(e) if is_retryable(&e) => {
+                let message = format!("{e:#}");
+                warn!(error = %message, retry_in = ?backoff, "transient GPU error; backing off");
+                store.record_error(&message)?;
+                engine.release_resources();
+                *ctx.control.backoff.lock().unwrap() = Some((message, Instant::now() + backoff));
+                let carry_on = ctx.control.sleep_unless_stopped(backoff);
+                *ctx.control.backoff.lock().unwrap() = None;
+                if !carry_on {
+                    return Ok(());
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                batch = engine.initial_batch();
+            }
+            Err(e) => return Err(e),
+        }
     }
-    Ok(())
 }
 
 /// Progress on the current chunk that is computed but possibly not yet committed.
@@ -270,7 +474,25 @@ impl Progress {
     }
 }
 
+/// Searches a claimed chunk until it is done or the worker pauses. On any
+/// error the chunk is handed back (committed progress is kept).
 fn search_claim(
+    ctx: &WorkerContext,
+    store: &mut Store,
+    engine: &mut Engine,
+    hardware: &str,
+    claim: Claim,
+    batch: &mut u64,
+) -> Result<()> {
+    let chunk_id = claim.chunk.id();
+    let result = search_claim_inner(ctx, store, engine, hardware, claim, batch);
+    if result.is_err() {
+        let _ = store.release(&chunk_id);
+    }
+    result
+}
+
+fn search_claim_inner(
     ctx: &WorkerContext,
     store: &mut Store,
     engine: &mut Engine,
@@ -293,9 +515,11 @@ fn search_claim(
     debug!(chunk = %progress.chunk_id, resume_from = %progress.cursor, "claimed chunk");
 
     while progress.cursor < end && ctx.control.state() == RUN {
+        let settings = ctx.settings.read().unwrap().clone();
         let batch_end = (&progress.cursor + *batch).min(end.clone());
-        let output = engine.run_batch(space, &progress.cursor, &batch_end)?;
-        *batch = next_batch_size(output.candidates, output.elapsed, ctx.batch_target).min(engine.max_batch());
+        let output = engine.run_batch(space, &progress.cursor, &batch_end, &settings.compute)?;
+        let target = Duration::from_millis(settings.compute.batch_target_ms);
+        *batch = next_batch_size(output.candidates, output.elapsed, target).min(engine.max_batch());
         if output.backend != progress.backend && progress.cursor > progress.committed {
             // Never attribute one backend's work to another.
             progress.commit(store, hardware)?;
@@ -314,13 +538,13 @@ fn search_claim(
         progress.matches.extend(output.matches);
         progress.audits.extend(output.audits);
 
-        if found || progress.cursor == end || progress.last_commit.elapsed() >= ctx.checkpoint_interval {
+        let interval = Duration::from_secs(settings.compute.checkpoint_interval_seconds);
+        if found || progress.cursor == end || progress.last_commit.elapsed() >= interval {
             progress.commit(store, hardware)?;
         }
         for decimal in nontrivial {
             warn!(%decimal, chunk = %progress.chunk_id, "VERIFIED NONTRIVIAL TRIPLE PALINDROME");
-            ctx.control.discovered.store(true, Ordering::SeqCst);
-            if ctx.search.stop_on_first_verified_discovery {
+            if settings.search.stop_on_first_verified_discovery {
                 ctx.control.stop("verified nontrivial discovery");
             }
         }

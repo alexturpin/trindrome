@@ -1,21 +1,23 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
+use serde_json::json;
 use trindrome_core::SearchSpace;
 use trindrome_core::filter::PRODUCTION_WINDOW;
 use trindrome_cpu::search_range;
 use trindrome_cuda::{CudaBackend, Prepared};
-use trindrome_worker::configuration::{Backend, Config};
-use trindrome_worker::engine::{CPU_BACKEND, Engine, cpu_hardware};
+use trindrome_worker::configuration::{Config, config_path, data_dir};
+use trindrome_worker::engine::{CPU_BACKEND, cpu_hardware, engines_for};
 use trindrome_worker::persistence::{Family, Requested, Store, now_ms};
-use trindrome_worker::scheduler;
+use trindrome_worker::scheduler::{self, RunOptions};
+use trindrome_worker::startup;
 
 #[derive(Parser)]
 #[command(
@@ -24,7 +26,7 @@ use trindrome_worker::scheduler;
     about = "Search for integers palindromic in bases 2, 10 and 16"
 )]
 struct Cli {
-    /// Configuration file (default: ./trindrome.toml if present)
+    /// Configuration file (default: TRINDROME_CONFIG, else trindrome.toml in the data directory)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -34,9 +36,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the worker in the foreground
+    /// Run the worker in this terminal; it computes only while the computer is idle
     Run {
-        /// Start immediately instead of waiting for the computer to be idle
+        /// Start immediately, skipping the inactivity requirements (safety limits still apply)
         #[arg(long)]
         now: bool,
         /// Use the CPU reference backend
@@ -53,7 +55,11 @@ enum Command {
     /// Ask the running worker to checkpoint and exit
     Stop,
     /// Show worker state, throughput and progress
-    Status,
+    Status {
+        /// Machine-readable output for scripts and front ends
+        #[arg(long)]
+        json: bool,
+    },
     /// Show searched index ranges per search space
     Coverage {
         /// Include spaces with no progress yet
@@ -64,15 +70,30 @@ enum Command {
     Discoveries,
     /// Check the database for coverage gaps, overlaps and unverifiable discoveries
     Verify,
-    /// Measure CPU throughput on representative search spaces (no database)
+    /// Measure GPU and CPU throughput on representative search spaces (no database)
     Benchmark {
         #[arg(long, default_value_t = 10)]
         seconds: u64,
         #[arg(long)]
         threads: Option<usize>,
     },
-    /// Print the effective configuration
+    /// Print the effective configuration and where it comes from
     Config,
+    /// Start the background agent automatically when you log in
+    Startup {
+        #[command(subcommand)]
+        action: StartupAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum StartupAction {
+    /// Start trindrome-agent at login (current user, no administrator rights)
+    Enable,
+    /// Stop starting it at login
+    Disable,
+    /// Show whether it starts at login
+    Status,
 }
 
 pub fn main() -> Result<ExitCode> {
@@ -82,11 +103,12 @@ pub fn main() -> Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
     let db = &config.storage.database_path;
 
     match cli.command {
-        Command::Run { now, cpu, threads } => run(&config, now, cpu, threads),
+        Command::Run { now, cpu, threads } => run(&config, cli.config.as_deref(), now, cpu, threads),
         Command::Pause => request(
             &config,
             Requested::Pause,
@@ -98,7 +120,8 @@ pub fn main() -> Result<ExitCode> {
             Requested::Stop,
             "stop requested; the worker will checkpoint and exit",
         ),
-        Command::Status => status(&config),
+        Command::Status { json } if json => status_json(&config),
+        Command::Status { .. } => status(&config),
         Command::Coverage { all } => coverage(&Store::open(db)?, all),
         Command::Discoveries => discoveries(&Store::open(db)?),
         Command::Verify => verify(&Store::open(db)?),
@@ -106,41 +129,30 @@ pub fn main() -> Result<ExitCode> {
             benchmark(seconds, threads.unwrap_or(config.compute.effective_cpu_threads()))
         }
         Command::Config => {
+            let (path, _) = config_path(cli.config.as_deref());
+            let exists = if path.exists() {
+                ""
+            } else {
+                " (not present; using defaults)"
+            };
+            println!("# configuration: {}{exists}", path.display());
+            println!("# database:      {}", db.display());
+            println!("# data dir:      {}", data_dir().display());
             print!("{}", toml::to_string_pretty(&config)?);
             for setting in config.unenforced_settings() {
-                println!("# not yet enforced: {setting}");
+                println!("# not enforced on this platform: {setting}");
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Startup { action } => startup_command(cli.config.as_deref(), action),
     }
 }
 
-fn run(config: &Config, now: bool, cpu: bool, threads: Option<usize>) -> Result<ExitCode> {
-    if !now && config.idle.enabled {
-        bail!(
-            "idle detection is not implemented yet, so automatic mode cannot start safely. \
-             Use `trindrome run --now` to start immediately."
-        );
-    }
-    let engines = if cpu || config.compute.backend == Backend::Cpu {
-        let threads = threads.unwrap_or(config.compute.effective_cpu_threads()).max(1);
-        (0..threads).map(|_| Engine::cpu()).collect()
-    } else {
-        // `auto` and `cuda` both require the GPU: never fall back to the CPU silently.
-        match Engine::cuda(&config.compute) {
-            Ok(engine) => {
-                eprintln!(
-                    "note: GPU temperature limits are not enforced yet (Phase 4); the GPU's own thermal \
-                     protection still applies"
-                );
-                vec![engine]
-            }
-            Err(e) => bail!(
-                "the CUDA backend is unavailable ({e}). compute.backend = {:?} never falls back to the CPU \
-                 silently; pass --cpu to search on the CPU instead.",
-                config.compute.backend
-            ),
-        }
+fn run(config: &Config, explicit: Option<&Path>, now: bool, cpu: bool, threads: Option<usize>) -> Result<ExitCode> {
+    let engines = engines_for(&config.compute, cpu, threads)?;
+    let options = RunOptions {
+        immediate: now,
+        config_file: Some(config_path(explicit)),
     };
 
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -153,7 +165,7 @@ fn run(config: &Config, now: bool, cpu: bool, threads: Option<usize>) -> Result<
         eprintln!("stopping after the current batch (Ctrl+C again to exit immediately)");
     })?;
 
-    let reason = scheduler::run(config, engines, &interrupted)?;
+    let reason = scheduler::run(config, engines, &options, &interrupted)?;
     println!("worker stopped: {reason}");
     let found = Store::open(&config.storage.database_path)?
         .discoveries()?
@@ -165,6 +177,41 @@ fn run(config: &Config, now: bool, cpu: bool, threads: Option<usize>) -> Result<
     Ok(ExitCode::SUCCESS)
 }
 
+fn startup_command(explicit: Option<&Path>, action: StartupAction) -> Result<ExitCode> {
+    match action {
+        StartupAction::Enable => {
+            let agent = std::env::current_exe()?.with_file_name(if cfg!(windows) {
+                "trindrome-agent.exe"
+            } else {
+                "trindrome-agent"
+            });
+            if !agent.exists() {
+                bail!("{} not found next to this executable", agent.display());
+            }
+            let mut command = format!("\"{}\"", agent.display());
+            if let Some(path) = explicit {
+                let path = std::fs::canonicalize(path).with_context(|| format!("{}", path.display()))?;
+                command.push_str(&format!(" --config \"{}\"", path.display()));
+            }
+            startup::set(startup::RUN_KEY, startup::VALUE_NAME, &command)?;
+            println!("trindrome-agent will start when you log in:\n  {command}");
+            println!(
+                "(listed in Task Manager â†’ Startup apps as \"{}\")",
+                startup::VALUE_NAME
+            );
+        }
+        StartupAction::Disable => {
+            startup::remove(startup::RUN_KEY, startup::VALUE_NAME)?;
+            println!("trindrome-agent will no longer start at login");
+        }
+        StartupAction::Status => match startup::get(startup::RUN_KEY, startup::VALUE_NAME)? {
+            Some(command) => println!("starts at login: {command}"),
+            None => println!("does not start at login"),
+        },
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn request(config: &Config, requested: Requested, message: &str) -> Result<ExitCode> {
     let db = &config.storage.database_path;
     Store::open(db)?.set_requested(requested)?;
@@ -172,6 +219,68 @@ fn request(config: &Config, requested: Requested, message: &str) -> Result<ExitC
     if !scheduler::worker_is_running(db) && requested != Requested::Run {
         println!("(no worker is running right now; a pause will apply when one starts)");
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The same facts as `status`, for scripts and front ends. Large counts are
+/// decimal strings; `detail` carries the structured reason.
+fn status_json(config: &Config) -> Result<ExitCode> {
+    let db = &config.storage.database_path;
+    let store = Store::open(db)?;
+    let worker = store.worker()?;
+    let running = scheduler::worker_is_running(db);
+    let totals = store.totals()?;
+    let window = Duration::from_secs((2 * config.compute.checkpoint_interval_seconds).max(60));
+    let rate = if running {
+        store.recent_rate(window, worker.started_at)?
+    } else {
+        0.0
+    };
+    let coverage = store.coverage()?;
+    let families: Vec<_> = [Family::Historical, Family::Frontier]
+        .into_iter()
+        .map(|family| {
+            let spaces: Vec<_> = coverage.iter().filter(|c| c.family == family).collect();
+            let total: BigUint = spaces.iter().map(|c| c.total.clone()).sum();
+            let covered: BigUint = spaces.iter().map(|c| c.covered.clone()).sum();
+            json!({
+                "family": family.as_str(),
+                "spaces": spaces.len(),
+                "covered": covered.to_string(),
+                "total": total.to_string(),
+                "percent": percent(&covered, &total),
+            })
+        })
+        .collect();
+    let found = store.discoveries()?;
+    let nontrivial = found.iter().filter(|d| d.nontrivial).count();
+    let (audits, audited) = store.audit_summary()?;
+    let backend = store.last_backend()?;
+    let detail: Option<serde_json::Value> = worker.detail.as_deref().and_then(|d| serde_json::from_str(d).ok());
+    let report = json!({
+        "worker": {
+            "running": running,
+            "state": if running { worker.state.as_str() } else { "stopped" },
+            "reason": worker.reason,
+            "reason_code": if running { worker.reason_code.clone() } else { None },
+            "detail": if running { detail } else { None },
+            "requested": worker.requested,
+            "pid": worker.pid,
+            "started_at_ms": worker.started_at,
+            "heartbeat_at_ms": worker.heartbeat_at,
+            "last_error": worker.last_error,
+        },
+        "backend": backend.as_ref().map(|(b, _)| b),
+        "hardware": backend.as_ref().map(|(_, h)| h),
+        "candidates_per_second": rate,
+        "searched_candidates": totals.candidates.to_string(),
+        "active_ms": totals.active_ms,
+        "last_checkpoint_at_ms": totals.last_checkpoint_at,
+        "families": families,
+        "discoveries": { "nontrivial": nontrivial, "trivial": found.len() - nontrivial },
+        "audits": { "slices": audits, "candidates": audited.to_string() },
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -196,6 +305,11 @@ fn status(config: &Config) -> Result<ExitCode> {
             worker.state,
             worker.pid.unwrap_or_default()
         );
+        if worker.state != "running"
+            && let Some(reason) = &worker.reason
+        {
+            println!("Why:         {reason}");
+        }
     } else {
         let reason = worker.reason.as_deref().unwrap_or("never run");
         println!("Worker:      not running (last stop: {reason})");

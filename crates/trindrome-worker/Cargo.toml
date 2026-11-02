@@ -9,6 +9,11 @@ rust-version.workspace = true
 name = "trindrome"
 path = "src/main.rs"
 
+# The same worker without a console window, for starting at login.
+[[bin]]
+name = "trindrome-agent"
+path = "src/agent.rs"
+
 [dependencies]
 trindrome-core.workspace = true
 trindrome-cpu.workspace = true
@@ -20,9 +25,17 @@ num-bigint.workspace = true
 num-traits.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+nvml-wrapper.workspace = true
+tracing-appender.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
 [dev-dependencies]
+trindrome-cuda.workspace = true
 tempfile.workspace = true

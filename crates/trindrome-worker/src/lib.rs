@@ -3,5 +3,11 @@
 
 pub mod configuration;
 pub mod engine;
+pub mod gpu_monitor;
+pub mod idle;
 pub mod persistence;
+pub mod policy;
+pub mod power;
 pub mod scheduler;
+pub mod sensors;
+pub mod startup;

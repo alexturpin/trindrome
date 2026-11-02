@@ -18,7 +18,7 @@ use trindrome_cpu::Match;
 use crate::configuration::Search;
 use crate::engine::Audit;
 
-pub const STORE_SCHEMA_VERSION: u32 = 1;
+pub const STORE_SCHEMA_VERSION: u32 = 2;
 
 /// Leading digits sharing an alphabet size, with the last length Regan covered in 2010.
 /// Each track advances through hexadecimal lengths independently.
@@ -152,7 +152,9 @@ CREATE TABLE IF NOT EXISTS worker_state (
     pid INTEGER,
     started_at INTEGER,
     heartbeat_at INTEGER,
-    last_error TEXT
+    last_error TEXT,
+    reason_code TEXT,
+    detail TEXT
 ) STRICT;
 
 INSERT OR IGNORE INTO worker_state (id) VALUES (1);
@@ -250,6 +252,10 @@ pub struct WorkerRow {
     pub started_at: Option<i64>,
     pub heartbeat_at: Option<i64>,
     pub last_error: Option<String>,
+    /// Stable machine-readable reason, e.g. `waiting_for_idle` or `thermal`.
+    pub reason_code: Option<String>,
+    /// JSON details for the reason, e.g. `{"temperature_c": 81, "resume_below_c": 72}`.
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -283,8 +289,19 @@ impl Store {
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
             [STORE_SCHEMA_VERSION.to_string()],
         )?;
-        let version: String =
+        let mut version: String =
             conn.query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))?;
+        if version == "1" {
+            // v2: structured pause reasons for the CLI, agent and GUI.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE worker_state ADD COLUMN reason_code TEXT;
+                 ALTER TABLE worker_state ADD COLUMN detail TEXT;
+                 UPDATE meta SET value = '2' WHERE key = 'schema_version';
+                 COMMIT;",
+            )?;
+            version = "2".into();
+        }
         ensure!(
             version == STORE_SCHEMA_VERSION.to_string(),
             "database schema version {version} is not supported (this build uses {STORE_SCHEMA_VERSION})"
@@ -568,17 +585,27 @@ impl Store {
         Ok(())
     }
 
-    pub fn heartbeat(&self, state: &str, reason: Option<&str>) -> Result<()> {
+    /// Records the worker's state with a human-readable reason, a stable reason
+    /// code and JSON details for front ends.
+    pub fn heartbeat(&self, state: &str, reason: Option<&str>, code: Option<&str>, detail: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "UPDATE worker_state SET state = ?1, reason = ?2, heartbeat_at = ?3 WHERE id = 1",
-            params![state, reason, now_ms()],
+            "UPDATE worker_state SET state = ?1, reason = ?2, reason_code = ?3, detail = ?4, heartbeat_at = ?5
+             WHERE id = 1",
+            params![state, reason, code, detail, now_ms()],
         )?;
+        Ok(())
+    }
+
+    pub fn record_error(&self, error: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE worker_state SET last_error = ?1 WHERE id = 1", [error])?;
         Ok(())
     }
 
     pub fn worker_stopped(&self, reason: &str, error: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "UPDATE worker_state SET state = 'stopped', reason = ?1, heartbeat_at = ?2, pid = NULL,
+            "UPDATE worker_state SET state = 'stopped', reason = ?1, reason_code = NULL, detail = NULL,
+                 heartbeat_at = ?2, pid = NULL,
                  last_error = COALESCE(?3, last_error),
                  requested = CASE WHEN requested = 'stop' THEN 'run' ELSE requested END
              WHERE id = 1",
@@ -589,7 +616,8 @@ impl Store {
 
     pub fn worker(&self) -> Result<WorkerRow> {
         Ok(self.conn.query_row(
-            "SELECT requested, state, reason, pid, started_at, heartbeat_at, last_error FROM worker_state WHERE id = 1",
+            "SELECT requested, state, reason, pid, started_at, heartbeat_at, last_error, reason_code, detail
+             FROM worker_state WHERE id = 1",
             [],
             |r| {
                 Ok(WorkerRow {
@@ -600,6 +628,8 @@ impl Store {
                     started_at: r.get(4)?,
                     heartbeat_at: r.get(5)?,
                     last_error: r.get(6)?,
+                    reason_code: r.get(7)?,
+                    detail: r.get(8)?,
                 })
             },
         )?)

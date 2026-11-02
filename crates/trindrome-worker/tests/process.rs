@@ -1,4 +1,4 @@
-//! End-to-end tests against the real `trindrome` executable: forced termination,
+﻿//! End-to-end tests against the real `trindrome` executable: forced termination,
 //! recovery, single-instance enforcement and pause/resume/stop control.
 
 use std::path::{Path, PathBuf};
@@ -46,6 +46,9 @@ fn setup(max_hex_digits: u32) -> (tempfile::TempDir, PathBuf, PathBuf) {
             chunk_candidates = 200000
             batch_target_ms = 20
             checkpoint_interval_seconds = 0
+
+            [idle]
+            require_ac_power = false
 
             [search]
             mode = "historical_replay"
