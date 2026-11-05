@@ -1,73 +1,36 @@
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "trindrome-coordinator",
-	"main": "src/index.ts",
-	"compatibility_date": "2026-10-01",
-	"observability": {
-		"enabled": true
-	},
-	// Needs the alexturpin.com zone on the same Cloudflare account. The
-	// workers.dev address keeps working too.
-	"routes": [
-		{
-			"pattern": "trindrome.alexturpin.com",
-			"custom_domain": true
-		}
-	],
-	// The single coordinator: work assignment, leases, accepted coverage and workers.
-	"durable_objects": {
-		"bindings": [
-			{
-				"name": "COORDINATOR",
-				"class_name": "Coordinator"
-			}
-		]
-	},
-	"migrations": [
-		{
-			"tag": "v1",
-			"new_sqlite_classes": [
-				"Coordinator"
-			]
-		}
-	],
-	// Survivor lists of accepted segments, kept to compare replicas.
-	"r2_buckets": [
-		{
-			"binding": "SURVIVORS",
-			"bucket_name": "trindrome-survivors"
-		},
-		{
-			"bucket_name": "trindrome-survivors",
-			"binding": "trindrome_survivors"
-		}
-	],
-	// Short-term flood control in front of everything else. Approximate and per
-	// location; the exact, longer-term limits live in the coordinator.
-	"ratelimits": [
-		{
-			"name": "REGISTER_LIMITER",
-			"namespace_id": "1001",
-			"simple": {
-				"limit": 5,
-				"period": 60
-			}
-		},
-		{
-			"name": "API_LIMITER",
-			"namespace_id": "1002",
-			"simple": {
-				"limit": 120,
-				"period": 60
-			}
-		}
-	],
-	// Override locally in .dev.vars (see .dev.vars.example).
-	"vars": {
-		"LEASE_TARGET_SECONDS": "1800",
-		"LEASE_TTL_SECONDS": "900",
-		"REPORT_INTERVAL_SECONDS": "300",
-		"REGISTRATIONS_PER_NETWORK_PER_DAY": "5",
-		"NEW_WORKERS_PER_HOUR": "100"
-	}
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "trindrome-coordinator",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+
+  // Needs the alexturpin.com zone on the same Cloudflare account. The
+  // workers.dev address keeps working too.
+  "routes": [{ "pattern": "trindrome.alexturpin.com", "custom_domain": true }],
+
+  // The single coordinator: work assignment, leases, accepted coverage and workers.
+  "durable_objects": {
+    "bindings": [{ "name": "COORDINATOR", "class_name": "Coordinator" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Coordinator"] }],
+
+  // Survivor lists of accepted segments, kept to compare replicas.
+  "r2_buckets": [{ "binding": "SURVIVORS", "bucket_name": "trindrome-survivors" }],
+
+  // Short-term flood control in front of everything else. Approximate and per
+  // location; the exact, longer-term limits live in the coordinator.
+  "ratelimits": [
+    { "name": "REGISTER_LIMITER", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } },
+    { "name": "API_LIMITER", "namespace_id": "1002", "simple": { "limit": 120, "period": 60 } }
+  ],
+
+  // Override locally in .dev.vars (see .dev.vars.example).
+  "vars": {
+    "LEASE_TARGET_SECONDS": "1800",
+    "LEASE_TTL_SECONDS": "900",
+    "REPORT_INTERVAL_SECONDS": "300",
+    "REGISTRATIONS_PER_NETWORK_PER_DAY": "5",
+    "NEW_WORKERS_PER_HOUR": "100"
+  }
 }
