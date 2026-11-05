@@ -90,6 +90,14 @@ CREATE TABLE IF NOT EXISTS discoveries (
   worker_id TEXT NOT NULL,
   found_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS imports (
+  hex_digits INTEGER NOT NULL,
+  leading INTEGER NOT NULL,
+  searched TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  imported_at INTEGER NOT NULL,
+  PRIMARY KEY (hex_digits, leading)
+);
 CREATE TABLE IF NOT EXISTS limits (
   key TEXT PRIMARY KEY,
   count INTEGER NOT NULL,
@@ -101,6 +109,8 @@ export interface Capabilities {
   max_hex_digits: number;
   /** Measured candidates per second. */
   rate: number;
+  /** Display name chosen by the worker's owner, if any. */
+  name: string | null;
 }
 
 export interface WorkChunkJson {
@@ -135,6 +145,17 @@ export interface Segment {
   backend: string | null;
   matches: { index: string; decimal: string; hexadecimal: string; nontrivial: boolean }[];
 }
+
+/** A space searched before the coordinator existed: `[0, searched)` is done. */
+export interface ImportedSpace {
+  hex_digits: number;
+  leading_hex_digit: number;
+  searched: bigint;
+}
+
+export type ImportResult =
+  | { status: "imported"; spaces: number; candidates: string }
+  | { status: "rejected"; reason: string };
 
 export type SegmentResult =
   | { status: "accepted"; cursor: string; complete: boolean; expires_at: number | null }
@@ -173,6 +194,12 @@ function maxBig(a: bigint, b: bigint): bigint {
   return a > b ? a : b;
 }
 
+class ImportRejected extends Error {}
+
+function spaceName(hexDigits: number, leading: number): string {
+  return `h${hexDigits}:${leading.toString(16).toUpperCase()}`;
+}
+
 function setting(env: Env, name: keyof Env, fallback: number): number {
   const value = Number(env[name]);
   return Number.isFinite(value) && value > 0 ? value : fallback;
@@ -185,6 +212,10 @@ export class Coordinator extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(SCHEMA);
+    const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(workers)").toArray();
+    if (!columns.some((c) => c.name === "name")) {
+      this.sql.exec("ALTER TABLE workers ADD COLUMN name TEXT");
+    }
   }
 
   private get leaseTtlMs(): number {
@@ -272,7 +303,13 @@ export class Coordinator extends DurableObject<Env> {
     return this.ctx.storage.transactionSync(() => {
       const now = Date.now();
       const rate = Math.min(Math.max(caps.rate, 1), MAX_RATE);
-      this.sql.exec("UPDATE workers SET rate = ?, last_seen = ? WHERE id = ?", rate, now, workerId);
+      this.sql.exec(
+        "UPDATE workers SET rate = ?, last_seen = ?, name = COALESCE(?, name) WHERE id = ?",
+        rate,
+        now,
+        caps.name,
+        workerId,
+      );
       const trust = this.sql.exec<{ trust: string }>("SELECT trust FROM workers WHERE id = ?", workerId).one().trust;
       const held = this.sql
         .exec<ChunkRow>(
@@ -559,6 +596,111 @@ export class Coordinator extends DurableObject<Env> {
     });
   }
 
+  // --- Imports ------------------------------------------------------------
+
+  /**
+   * Records an owner's earlier local search as done, so the frontier continues
+   * from it instead of repeating it. Each track's lengths must be contiguous
+   * from its first frontier length; shorter (historical) lengths are ignored.
+   * Importing the same coverage again is harmless; anything that conflicts with
+   * work the coordinator already handed out is refused, all or nothing.
+   */
+  importCoverage(workerId: string, imported: ImportedSpace[], name: string | null): ImportResult {
+    this.sql.exec("UPDATE workers SET name = COALESCE(?, name) WHERE id = ?", name, workerId);
+    try {
+      // Throwing ImportRejected rolls back whatever this import already wrote.
+      return this.ctx.storage.transactionSync((): ImportResult => {
+        const now = Date.now();
+        let spaces = 0;
+        let candidates = 0n;
+        for (const [leads, first] of TRACKS) {
+          const track = imported.filter((s) => leads.includes(s.leading_hex_digit) && s.hex_digits >= first);
+          if (track.length === 0) {
+            continue;
+          }
+          const last = Math.max(...track.map((s) => s.hex_digits));
+          for (let n = first; n <= last; n++) {
+            for (const lead of leads) {
+              const name = spaceName(n, lead);
+              const entries = track.filter((s) => s.hex_digits === n && s.leading_hex_digit === lead);
+              if (entries.length !== 1) {
+                throw new ImportRejected(`${name} must appear exactly once`);
+              }
+              const total = candidateCount(n, lead);
+              const searched = entries[0].searched;
+              if (searched < 0n || searched > total) {
+                throw new ImportRejected(`${name} searched ${searched} of ${total}`);
+              }
+              if (total > MAX_INDEX) {
+                throw new ImportRejected(`${name} is too large to lease`);
+              }
+              if (this.importSpace(n, lead, total, searched, workerId, now)) {
+                spaces++;
+                candidates += searched;
+              }
+            }
+          }
+        }
+        return { status: "imported", spaces, candidates: candidates.toString() };
+      });
+    } catch (e) {
+      if (e instanceof ImportRejected) {
+        return { status: "rejected", reason: e.message };
+      }
+      throw e;
+    }
+  }
+
+  /** Imports one space; false if this exact import was already recorded. */
+  private importSpace(n: number, lead: number, total: bigint, searched: bigint, workerId: string, now: number): boolean {
+    const name = spaceName(n, lead);
+    const previous = this.sql
+      .exec<{ searched: string }>("SELECT searched FROM imports WHERE hex_digits = ? AND leading = ?", n, lead)
+      .toArray()[0];
+    if (previous) {
+      if (BigInt(previous.searched) === searched) {
+        return false;
+      }
+      throw new ImportRejected(`${name} was already imported with ${previous.searched} searched`);
+    }
+    const chunks = this.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM chunks WHERE hex_digits = ? AND leading = ?", n, lead)
+      .one().n;
+    if (chunks > 0) {
+      throw new ImportRejected(`the coordinator has already handed out work in ${name}`);
+    }
+    this.sql.exec(
+      `INSERT INTO spaces (hex_digits, leading, total, next_unallocated) VALUES (?, ?, ?, ?)
+       ON CONFLICT (hex_digits, leading) DO UPDATE SET next_unallocated = excluded.next_unallocated`,
+      n,
+      lead,
+      total.toString(),
+      searched.toString(),
+    );
+    if (searched > 0n) {
+      const id = chunkId(n, lead, 0n, searched);
+      this.sql.exec(
+        `INSERT INTO chunks (id, hex_digits, leading, start_index, end_index, cursor, state, created_at)
+         VALUES (?, ?, ?, '0', ?, ?, 'done', ?)`,
+        id,
+        n,
+        lead,
+        searched.toString(),
+        searched.toString(),
+        now,
+      );
+    }
+    this.sql.exec(
+      "INSERT INTO imports (hex_digits, leading, searched, worker_id, imported_at) VALUES (?, ?, ?, ?, ?)",
+      n,
+      lead,
+      searched.toString(),
+      workerId,
+      now,
+    );
+    return true;
+  }
+
   // --- Statistics ---------------------------------------------------------
 
   coverage() {
@@ -585,13 +727,28 @@ export class Coordinator extends DurableObject<Env> {
         now - 3_600_000,
       )
       .one();
+    const contributors = this.sql
+      .exec<{ worker: string; name: string | null; candidates: number; last_seen: number }>(
+        `SELECT w.id AS worker, w.name AS name, w.last_seen AS last_seen,
+                COALESCE((SELECT SUM(candidates) FROM segments s WHERE s.worker_id = w.id), 0) +
+                COALESCE((SELECT SUM(CAST(searched AS REAL)) FROM imports i WHERE i.worker_id = w.id), 0) AS candidates
+         FROM workers w ORDER BY candidates DESC LIMIT 25`,
+      )
+      .toArray()
+      .filter((c) => c.candidates > 0);
     return {
       versions,
       spaces,
+      contributors,
       workers_registered: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM workers").one().n,
       workers_last_hour: lastHour.workers,
       candidates_per_second_last_hour: lastHour.candidates / 3600,
-      discoveries: this.sql.exec("SELECT * FROM discoveries ORDER BY found_at").toArray(),
+      discoveries: this.sql
+        .exec(
+          `SELECT d.*, w.name AS worker_name FROM discoveries d LEFT JOIN workers w ON w.id = d.worker_id
+           ORDER BY d.found_at`,
+        )
+        .toArray(),
     };
   }
 }

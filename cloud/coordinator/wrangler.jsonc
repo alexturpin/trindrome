@@ -5,6 +5,10 @@
   "compatibility_date": "2026-10-01",
   "observability": { "enabled": true },
 
+  // Needs the alexturpin.com zone on the same Cloudflare account. The
+  // workers.dev address keeps working too.
+  "routes": [{ "pattern": "trindrome.alexturpin.com", "custom_domain": true }],
+
   // The single coordinator: work assignment, leases, accepted coverage and workers.
   "durable_objects": {
     "bindings": [{ "name": "COORDINATOR", "class_name": "Coordinator" }]

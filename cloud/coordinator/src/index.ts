@@ -3,6 +3,7 @@
 // already-checked requests to the coordinator.
 
 import { checkSurvivors, chunkId, versions } from "./core";
+import { renderIndex } from "./page";
 import type { Capabilities, Coordinator, WorkChunkJson } from "./coordinator";
 
 export { Coordinator } from "./coordinator";
@@ -40,6 +41,15 @@ function fromBase64(s: string): Uint8Array {
 
 function hex(bytes: ArrayBuffer): string {
   return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** A display name: 1 to 40 printable characters, or null. */
+function displayName(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const name = value.replace(/\p{C}/gu, "").trim();
+  return name ? [...name].slice(0, 40).join("") : null;
 }
 
 function index(value: unknown, name: string): bigint {
@@ -104,8 +114,8 @@ async function readBody(request: Request): Promise<{ raw: ArrayBuffer; value: an
   }
 }
 
-/** Authenticates a registered worker; returns its ID. */
-async function authenticate(request: Request, env: Env, raw: ArrayBuffer): Promise<string> {
+/** Authenticates a registered worker; returns its ID and public key. */
+async function authenticate(request: Request, env: Env, raw: ArrayBuffer): Promise<{ workerId: string; publicKey: string }> {
   const workerId = request.headers.get("Trindrome-Worker") ?? "";
   if (!workerId) {
     throw new HttpError(401, "unknown_worker", "Trindrome-Worker header missing");
@@ -118,7 +128,32 @@ async function authenticate(request: Request, env: Env, raw: ArrayBuffer): Promi
     throw new HttpError(401, "unknown_worker");
   }
   await verifySignature(request, raw, publicKey);
-  return workerId;
+  return { workerId, publicKey };
+}
+
+/** Owners are the keys listed in the OWNER_PUBLIC_KEYS secret, comma-separated. */
+function isOwner(env: Env, publicKey: string): boolean {
+  return (env.OWNER_PUBLIC_KEYS ?? "")
+    .split(",")
+    .map((k) => k.trim())
+    .includes(publicKey);
+}
+
+async function importCoverage(env: Env, workerId: string, publicKey: string, body: any): Promise<Response> {
+  if (!isOwner(env, publicKey)) {
+    throw new HttpError(403, "forbidden", "only an owner key can import coverage");
+  }
+  if (body.generator_version !== versions.generator || !Array.isArray(body.spaces)) {
+    throw new HttpError(400, "bad_request", `spaces from generator ${versions.generator} are required`);
+  }
+  const spaces = body.spaces.map((s: any) => {
+    if (!Number.isInteger(s?.hex_digits) || !Number.isInteger(s?.leading_hex_digit)) {
+      throw new HttpError(400, "bad_request", "each space needs hex_digits and leading_hex_digit");
+    }
+    return { hex_digits: s.hex_digits, leading_hex_digit: s.leading_hex_digit, searched: index(s.searched, "searched") };
+  });
+  const result = await coordinator(env).importCoverage(workerId, spaces, displayName(body.name));
+  return json(result, result.status === "imported" ? 200 : 409);
 }
 
 async function register(request: Request, env: Env): Promise<Response> {
@@ -158,6 +193,7 @@ async function acquire(env: Env, workerId: string, body: any): Promise<Response>
   const caps: Capabilities = {
     max_hex_digits: Number.isInteger(body.max_hex_digits) ? body.max_hex_digits : 0,
     rate: typeof body.rate === "number" && Number.isFinite(body.rate) ? body.rate : 0,
+    name: displayName(body.name),
   };
   const lease = await coordinator(env).acquire(workerId, caps);
   const retry = Number(env.REPORT_INTERVAL_SECONDS) || 300;
@@ -214,6 +250,11 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET" && path === "/v1/coverage") {
     return json(await coordinator(env).coverage());
   }
+  if (request.method === "GET" && path === "/") {
+    return new Response(renderIndex(await coordinator(env).coverage()), {
+      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=60" },
+    });
+  }
   if (request.method !== "POST") {
     throw new HttpError(404, "not_found");
   }
@@ -221,7 +262,10 @@ async function route(request: Request, env: Env): Promise<Response> {
     return register(request, env);
   }
   const { raw, value } = await readBody(request);
-  const workerId = await authenticate(request, env, raw);
+  const { workerId, publicKey } = await authenticate(request, env, raw);
+  if (path === "/v1/import") {
+    return importCoverage(env, workerId, publicKey, value);
+  }
   if (path === "/v1/leases") {
     return acquire(env, workerId, value);
   }

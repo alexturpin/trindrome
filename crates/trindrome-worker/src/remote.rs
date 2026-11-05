@@ -70,6 +70,7 @@ pub struct Client {
     identity: Identity,
     worker_id: Mutex<Option<String>>,
     hardware: String,
+    name: Option<String>,
 }
 
 impl Client {
@@ -82,9 +83,16 @@ impl Client {
             agent: ureq::AgentBuilder::new().timeout(TIMEOUT).build(),
             worker_id: Mutex::new(worker_id),
             hardware: hardware.to_string(),
+            name: None,
             identity,
             url,
         })
+    }
+
+    /// The display name sent with every lease request.
+    pub fn with_name(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
     }
 
     pub fn url(&self) -> &str {
@@ -167,6 +175,7 @@ impl Client {
             "filter_version": FILTER_VERSION,
             "max_hex_digits": MAX_HEX_DIGITS,
             "rate": rate,
+            "name": self.name,
         });
         let reply = self.call("/v1/leases", &body)?;
         if reply.status != 200 {
@@ -245,6 +254,60 @@ impl Client {
             _ => bail!("unexpected reply to a release: {}", reply.describe()),
         }
     }
+
+    pub fn public_key(&self) -> String {
+        self.identity.public_key_base64()
+    }
+
+    /// Records local search as done on the coordinator (owner keys only).
+    /// Returns the number of spaces it newly recorded and their candidates.
+    pub fn import_coverage(&self, spaces: &[ImportedSpace]) -> Result<(u64, String)> {
+        let spaces: Vec<Value> = spaces
+            .iter()
+            .map(|s| {
+                json!({
+                    "hex_digits": s.hex_digits,
+                    "leading_hex_digit": s.leading_hex_digit,
+                    "searched": s.searched.to_string(),
+                })
+            })
+            .collect();
+        let body = json!({ "generator_version": GENERATOR_VERSION, "spaces": spaces, "name": self.name });
+        let reply = self.call("/v1/import", &body)?;
+        if reply.status != 200 {
+            bail!("the coordinator refused the import: {}", reply.describe());
+        }
+        Ok((
+            reply.body["spaces"].as_u64().unwrap_or(0),
+            reply.body["candidates"].as_str().unwrap_or("0").to_string(),
+        ))
+    }
+}
+
+/// A space whose indices `[0, searched)` were searched locally.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedSpace {
+    pub hex_digits: u32,
+    pub leading_hex_digit: u32,
+    pub searched: BigUint,
+}
+
+/// The coverage of a local database that can be imported: per started space,
+/// the searched prefix from index 0. Coverage past a gap is left out, since the
+/// coordinator would hand it out again.
+pub fn importable_coverage(store: &Store) -> Result<Vec<ImportedSpace>> {
+    Ok(store
+        .coverage()?
+        .into_iter()
+        .filter_map(|c| match c.intervals.first() {
+            Some((start, end)) if *start == BigUint::ZERO => Some(ImportedSpace {
+                hex_digits: c.space.hex_digits(),
+                leading_hex_digit: c.space.leading().into(),
+                searched: end.clone(),
+            }),
+            _ => None,
+        })
+        .collect())
 }
 
 /// The coordinator rejected our proof of search. That means this machine's

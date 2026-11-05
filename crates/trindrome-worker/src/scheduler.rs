@@ -186,7 +186,7 @@ pub fn run(config: &Config, engines: Vec<Engine>, options: &RunOptions, interrup
     let remote = match &config.coordinator.url {
         Some(url) => {
             let identity_dir = database.parent().unwrap_or(Path::new("."));
-            let client = Client::new(url, identity_dir, &hardware)?;
+            let client = Client::new(url, identity_dir, &hardware)?.with_name(config.coordinator.name.clone());
             info!(coordinator = %client.url(), worker_id = ?client.worker_id(), "distributed mode");
             Some(client)
         }

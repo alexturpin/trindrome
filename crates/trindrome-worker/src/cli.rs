@@ -15,7 +15,9 @@ use trindrome_cpu::search_range;
 use trindrome_cuda::{CudaBackend, Prepared};
 use trindrome_worker::configuration::{Config, config_path, data_dir};
 use trindrome_worker::engine::{CPU_BACKEND, cpu_hardware, engines_for};
+use trindrome_worker::identity::Identity;
 use trindrome_worker::persistence::{Family, Requested, Store, now_ms};
+use trindrome_worker::remote::{Client, importable_coverage};
 use trindrome_worker::scheduler::{self, RunOptions};
 use trindrome_worker::startup;
 
@@ -84,6 +86,27 @@ enum Command {
         #[command(subcommand)]
         action: StartupAction,
     },
+    /// Distributed mode: this installation's key, and moving local progress to a coordinator
+    Coordinator {
+        #[command(subcommand)]
+        action: CoordinatorAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CoordinatorAction {
+    /// Print this installation's public key (for the coordinator's OWNER_PUBLIC_KEYS)
+    Key,
+    /// Record this database's local search as done on the coordinator, so
+    /// distributed work continues from it (owner keys only)
+    Import {
+        /// Coordinator URL (default: coordinator.url from the configuration)
+        #[arg(long)]
+        url: Option<String>,
+        /// Show what would be imported without contacting the coordinator
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -145,7 +168,51 @@ pub fn main() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Startup { action } => startup_command(cli.config.as_deref(), action),
+        Command::Coordinator { action } => coordinator_command(&config, action),
     }
+}
+
+fn coordinator_command(config: &Config, action: CoordinatorAction) -> Result<ExitCode> {
+    let db = &config.storage.database_path;
+    let identity_dir = db.parent().unwrap_or(Path::new("."));
+    match action {
+        CoordinatorAction::Key => {
+            println!("{}", Identity::load_or_create(identity_dir)?.public_key_base64());
+        }
+        CoordinatorAction::Import { url, dry_run } => {
+            let store = Store::open(db)?;
+            if !store.leased_chunk_ids()?.is_empty() {
+                bail!("this database already searches for a coordinator; only a purely local search can be imported");
+            }
+            if !dry_run && scheduler::worker_is_running(db) {
+                bail!("stop the worker first (`trindrome stop`), so its progress cannot change during the import");
+            }
+            let spaces = importable_coverage(&store)?;
+            let total: BigUint = spaces.iter().map(|s| &s.searched).sum();
+            println!(
+                "{} spaces, {} candidates searched from index 0",
+                spaces.len(),
+                human(to_f64(&total))
+            );
+            if dry_run {
+                for s in spaces.iter().filter(|s| s.searched > BigUint::ZERO) {
+                    println!("  h{}:{:X}  {}", s.hex_digits, s.leading_hex_digit, s.searched);
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let Some(url) = url.or_else(|| config.coordinator.url.clone()) else {
+                bail!("no coordinator: pass --url or set coordinator.url");
+            };
+            let client = Client::new(&url, identity_dir, "import")?.with_name(config.coordinator.name.clone());
+            let (imported, candidates) = client.import_coverage(&spaces)?;
+            println!(
+                "{} recorded {imported} spaces ({candidates} candidates) as searched",
+                client.url()
+            );
+            println!("historical lengths are ignored; spaces it already had are unchanged");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run(config: &Config, explicit: Option<&Path>, now: bool, cpu: bool, threads: Option<usize>) -> Result<ExitCode> {

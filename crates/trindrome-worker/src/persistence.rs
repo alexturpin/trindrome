@@ -1216,7 +1216,7 @@ impl Store {
         Ok(())
     }
 
-    fn leased_chunk_ids(&self) -> Result<HashSet<String>> {
+    pub fn leased_chunk_ids(&self) -> Result<HashSet<String>> {
         let mut stmt = self.conn.prepare("SELECT chunk_id FROM leases")?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

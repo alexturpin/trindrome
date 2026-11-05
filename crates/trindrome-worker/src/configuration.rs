@@ -220,6 +220,9 @@ impl Default for Logging {
 pub struct Coordinator {
     /// E.g. `"https://trindrome.example.workers.dev"`. Unset means local-only.
     pub url: Option<String>,
+    /// Shown on the coordinator's public page next to this machine's work and
+    /// discoveries. Unset shows the worker ID instead.
+    pub name: Option<String>,
     /// A pause longer than this hands the current lease back to the coordinator.
     pub release_after_pause_seconds: u64,
 }
@@ -228,6 +231,7 @@ impl Default for Coordinator {
     fn default() -> Self {
         Self {
             url: None,
+            name: None,
             release_after_pause_seconds: 120,
         }
     }
@@ -318,6 +322,11 @@ impl Config {
             && !(url.starts_with("https://") || url.starts_with("http://"))
         {
             bail!("coordinator.url must start with https:// (or http:// for local testing)");
+        }
+        if let Some(name) = &self.coordinator.name
+            && (name.trim().is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control))
+        {
+            bail!("coordinator.name must be 1 to 40 printable characters");
         }
         Ok(())
     }

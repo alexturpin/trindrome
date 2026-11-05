@@ -1,6 +1,6 @@
 # Distributed search (design)
 
-Status: **phases 5a and 5b are implemented and tested locally with `wrangler dev`; nothing is deployed.** This is the plan for phase 5, which turns spec §14 into concrete decisions. [Implementation status](#implementation-status) lists what is built and where the implementation differs from the design. Where the design departs from the spec, the reasons are under [Deviations from spec §14](#deviations-from-spec-14).
+Status: **phases 5a and 5b are implemented and tested locally with `wrangler dev`, ready to deploy (see [Deploying](#deploying)).** This is the plan for phase 5, which turns spec §14 into concrete decisions. [Implementation status](#implementation-status) lists what is built and where the implementation differs from the design. Where the design departs from the spec, the reasons are under [Deviations from spec §14](#deviations-from-spec-14).
 
 Friends, and later the public, run the same agent. A coordinator on Cloudflare decides *what* each machine searches. Each machine's local resource policy still decides *whether* it runs. The search engine, the work-unit format and the local checkpoint rule do not change.
 
@@ -223,8 +223,10 @@ Built (phases 5a and 5b):
 - **`cloud/coordinator`:**
   - the Worker: signatures, both rate-limit layers, survivor checks, R2;
   - the Coordinator Durable Object: registration, leases, epochs, lazy expiry, segments, coverage.
+- **Coverage import and the public page:** `POST /v1/import` (owner keys from the `OWNER_PUBLIC_KEYS` secret only) and `GET /`, which lists progress, discoveries with their finder's display name, and contributors.
 - **The agent's distributed mode:**
-  - `[coordinator] url`;
+  - `[coordinator] url` and an optional `name`;
+  - `trindrome coordinator key` and `trindrome coordinator import`;
   - the identity key under DPAPI;
   - `remote.rs` (client and sync thread);
   - store schema v3 with `leases` and `segments`;
@@ -287,7 +289,47 @@ url = "http://127.0.0.1:8787"
 release_after_pause_seconds = 10
 ```
 
-`GET /v1/coverage` shows the coordinator's view.
+`GET /v1/coverage` shows the coordinator's view, and `GET /` renders it as a page. To test an import locally, pass an owner key with `npx wrangler dev --var OWNER_PUBLIC_KEYS:<key>`.
+
+### Deploying
+
+The coordinator runs at `trindrome.alexturpin.com` (a custom domain in `wrangler.jsonc`, so the `alexturpin.com` zone must be on the same Cloudflare account) and at its `workers.dev` address. In `cloud/coordinator`, after `npx wrangler login`:
+
+```bash
+npx wrangler r2 bucket create trindrome-survivors
+```
+
+```bash
+npm run deploy
+```
+
+Then make your machine an owner. `trindrome coordinator key` prints this installation's public key. Store it as a secret:
+
+```bash
+npx wrangler secret put OWNER_PUBLIC_KEYS
+```
+
+The free Workers plan allows 10 ms of CPU per request, which segment checks can exceed. Use Workers Paid.
+
+### Moving a local search onto the coordinator
+
+A machine that searched locally imports its progress once, so the coordinator continues from it instead of handing the same ranges out again:
+
+1. `trindrome stop`, so the local progress cannot change.
+2. `trindrome coordinator import --url https://trindrome.alexturpin.com`. Each space's searched prefix from index 0 becomes a finished chunk. Historical lengths are ignored, and only an owner key may import. Re-running it is harmless. An import that disagrees with an earlier import, or with work the coordinator has already handed out, is refused as a whole.
+3. Add `[coordinator]` with `url` (and optionally `name`, shown on the public page) to `trindrome.toml`, then start the agent again.
+
+The local database keeps its unfinished chunk, which is never searched again in distributed mode.
+
+### Packaging for friends
+
+`packaging\package.ps1 -CoordinatorUrl https://trindrome.alexturpin.com` builds `dist\trindrome-<version>.zip`. It contains:
+- release binaries with the C runtime linked statically;
+- `install.cmd`, which installs to `%LOCALAPPDATA%\Trindrome`, keeps an existing configuration and turns on start at login;
+- a `trindrome.toml` with the coordinator's URL;
+- a `README.txt` for the friend.
+
+The binaries are not code-signed, so SmartScreen warns on first run. The kernels cover RTX 30-series and newer (sm_86+) and need a driver with CUDA 13.
 
 ## Deviations from spec §14
 
