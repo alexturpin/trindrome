@@ -111,6 +111,22 @@ export interface Capabilities {
   rate: number;
   /** Display name chosen by the worker's owner, if any. */
   name: string | null;
+  /** The computer's name. Private: never shown on the public page. */
+  hostname: string | null;
+}
+
+/** A worker as its owner sees it, private details included. */
+export interface WorkerInfo {
+  worker_id: string;
+  name: string | null;
+  hostname: string | null;
+  gpu: string | null;
+  network: string;
+  candidates: number;
+  discoveries: number;
+  registered_at: number;
+  last_seen: number;
+  [key: string]: SqlStorageValue;
 }
 
 export interface WorkChunkJson {
@@ -212,9 +228,12 @@ export class Coordinator extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(SCHEMA);
+    // Columns added after the first deployment.
     const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(workers)").toArray();
-    if (!columns.some((c) => c.name === "name")) {
-      this.sql.exec("ALTER TABLE workers ADD COLUMN name TEXT");
+    for (const column of ["name", "hostname"]) {
+      if (!columns.some((c) => c.name === column)) {
+        this.sql.exec(`ALTER TABLE workers ADD COLUMN ${column} TEXT`);
+      }
     }
   }
 
@@ -231,9 +250,11 @@ export class Coordinator extends DurableObject<Env> {
     agentVersion: string,
     gpu: string | null,
     gpuHash: string | null,
+    hostname: string | null,
   ): { worker_id: string } | { error: "rate_limited" } {
     const existing = this.sql.exec<{ id: string }>("SELECT id FROM workers WHERE public_key = ?", publicKey).toArray();
     if (existing.length > 0) {
+      this.sql.exec("UPDATE workers SET hostname = COALESCE(?, hostname) WHERE id = ?", hostname, existing[0].id);
       return { worker_id: existing[0].id };
     }
     const now = Date.now();
@@ -252,14 +273,15 @@ export class Coordinator extends DurableObject<Env> {
     }
     const id = "w_" + crypto.randomUUID().replaceAll("-", "").slice(0, 20);
     this.sql.exec(
-      `INSERT INTO workers (id, public_key, network, agent_version, gpu, gpu_hash, registered_at, last_seen)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO workers (id, public_key, network, agent_version, gpu, gpu_hash, hostname, registered_at, last_seen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       publicKey,
       network,
       agentVersion,
       gpu,
       gpuHash,
+      hostname,
       now,
       now,
     );
@@ -304,10 +326,11 @@ export class Coordinator extends DurableObject<Env> {
       const now = Date.now();
       const rate = Math.min(Math.max(caps.rate, 1), MAX_RATE);
       this.sql.exec(
-        "UPDATE workers SET rate = ?, last_seen = ?, name = COALESCE(?, name) WHERE id = ?",
+        "UPDATE workers SET rate = ?, last_seen = ?, name = ?, hostname = COALESCE(?, hostname) WHERE id = ?",
         rate,
         now,
         caps.name,
+        caps.hostname,
         workerId,
       );
       const trust = this.sql.exec<{ trust: string }>("SELECT trust FROM workers WHERE id = ?", workerId).one().trust;
@@ -702,6 +725,19 @@ export class Coordinator extends DurableObject<Env> {
   }
 
   // --- Statistics ---------------------------------------------------------
+
+  /** Every worker with its private details, for the owner only. */
+  workers(): WorkerInfo[] {
+    return this.sql
+      .exec<WorkerInfo>(
+        `SELECT w.id AS worker_id, w.name, w.hostname, w.gpu, w.network, w.registered_at, w.last_seen,
+                COALESCE((SELECT SUM(candidates) FROM segments s WHERE s.worker_id = w.id), 0) +
+                COALESCE((SELECT SUM(CAST(searched AS REAL)) FROM imports i WHERE i.worker_id = w.id), 0) AS candidates,
+                (SELECT COUNT(*) FROM discoveries d WHERE d.worker_id = w.id) AS discoveries
+         FROM workers w ORDER BY w.last_seen DESC`,
+      )
+      .toArray();
+  }
 
   coverage() {
     const now = Date.now();

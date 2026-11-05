@@ -175,6 +175,7 @@ async function register(request: Request, env: Env): Promise<Response> {
     text(value.agent_version) ?? "unknown",
     text(value.gpu),
     text(value.gpu_hash),
+    displayName(value.hostname),
   );
   if ("error" in result) {
     throw new HttpError(429, result.error, "too many new workers from this network or overall; try again later");
@@ -194,6 +195,7 @@ async function acquire(env: Env, workerId: string, body: any): Promise<Response>
     max_hex_digits: Number.isInteger(body.max_hex_digits) ? body.max_hex_digits : 0,
     rate: typeof body.rate === "number" && Number.isFinite(body.rate) ? body.rate : 0,
     name: displayName(body.name),
+    hostname: displayName(body.hostname),
   };
   const lease = await coordinator(env).acquire(workerId, caps);
   const retry = Number(env.REPORT_INTERVAL_SECONDS) || 300;
@@ -265,6 +267,12 @@ async function route(request: Request, env: Env): Promise<Response> {
   const { workerId, publicKey } = await authenticate(request, env, raw);
   if (path === "/v1/import") {
     return importCoverage(env, workerId, publicKey, value);
+  }
+  if (path === "/v1/workers") {
+    if (!isOwner(env, publicKey)) {
+      throw new HttpError(403, "forbidden", "only an owner key can list workers");
+    }
+    return json({ workers: await coordinator(env).workers() });
   }
   if (path === "/v1/leases") {
     return acquire(env, workerId, value);

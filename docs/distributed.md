@@ -226,7 +226,8 @@ Built (phases 5a and 5b):
 - **Coverage import and the public page:** `POST /v1/import` (owner keys from the `OWNER_PUBLIC_KEYS` secret only) and `GET /`, which lists progress, discoveries with their finder's display name, and contributors.
 - **The agent's distributed mode:**
   - `[coordinator] url` and an optional `name`;
-  - `trindrome coordinator key` and `trindrome coordinator import`;
+  - `trindrome coordinator key`, `import`, and `workers` (owner keys only: every worker with its computer name and network, recorded privately so a discoverer can be found even under an anonymous display name);
+  - the display name in the settings window, applied at the next lease request without a restart;
   - the identity key under DPAPI;
   - `remote.rs` (client and sync thread);
   - store schema v3 with `leases` and `segments`;

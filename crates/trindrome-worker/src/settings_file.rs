@@ -24,6 +24,8 @@ pub struct UserSettings {
     pub pause_temperature_c: u32,
     pub resume_temperature_c: u32,
     pub prevent_automatic_sleep: bool,
+    /// Display name on the coordinator's public page; empty means none.
+    pub coordinator_name: String,
 }
 
 impl UserSettings {
@@ -39,6 +41,7 @@ impl UserSettings {
             pause_temperature_c: c.thermal.pause_temperature_c,
             resume_temperature_c: c.thermal.resume_temperature_c,
             prevent_automatic_sleep: c.power.prevent_automatic_sleep,
+            coordinator_name: c.coordinator.name.clone().unwrap_or_default(),
         }
     }
 
@@ -53,6 +56,7 @@ impl UserSettings {
         c.thermal.pause_temperature_c = self.pause_temperature_c;
         c.thermal.resume_temperature_c = self.resume_temperature_c;
         c.power.prevent_automatic_sleep = self.prevent_automatic_sleep;
+        c.coordinator.name = Some(self.coordinator_name.trim().to_string()).filter(|n| !n.is_empty());
     }
 }
 
@@ -94,6 +98,13 @@ pub fn save(path: &Path, s: &UserSettings) -> Result<()> {
 
     section(&mut doc, "power")["prevent_automatic_sleep"] = value(s.prevent_automatic_sleep);
 
+    let name = s.coordinator_name.trim();
+    if !name.is_empty() {
+        section(&mut doc, "coordinator")["name"] = value(name);
+    } else if let Some(coordinator) = doc.get_mut("coordinator").and_then(Item::as_table_mut) {
+        coordinator.remove("name");
+    }
+
     let updated = doc.to_string();
     let config: Config = toml::from_str(&updated).context("the new settings do not form a valid configuration")?;
     config.validate()?;
@@ -134,6 +145,7 @@ mode = "frontier"
         s.idle_minutes = 3;
         s.exclusive_gpu_apps.push(r"C:\Games\Sim\sim.exe".into());
         s.prevent_automatic_sleep = true;
+        s.coordinator_name = " Alex ".into();
         save(&path, &s).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -146,8 +158,14 @@ mode = "frontier"
             assert!(text.contains(kept), "lost {kept:?}:\n{text}");
         }
         let reloaded = Config::load_from(&path, true).unwrap();
+        s.coordinator_name = "Alex".into();
         assert_eq!(UserSettings::from_config(&reloaded), s);
         assert_eq!(reloaded.compute.batch_target_ms, 150);
+
+        // Clearing the name removes the key rather than writing an empty one.
+        s.coordinator_name.clear();
+        save(&path, &s).unwrap();
+        assert_eq!(Config::load_from(&path, true).unwrap().coordinator.name, None);
     }
 
     #[test]

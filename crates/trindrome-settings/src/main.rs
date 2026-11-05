@@ -50,6 +50,7 @@ struct SettingsApp {
     explicit: Option<PathBuf>,
     path: PathBuf,
     database: PathBuf,
+    coordinator_url: Option<String>,
     load_error: Option<String>,
     saved: UserSettings,
     edit: UserSettings,
@@ -75,6 +76,7 @@ impl SettingsApp {
             explicit,
             path,
             database: config.storage.database_path.clone(),
+            coordinator_url: config.coordinator.url.clone(),
             load_error,
             edit: saved.clone(),
             saved,
@@ -308,6 +310,29 @@ impl SettingsApp {
         }
     }
 
+    fn shared_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Shared search");
+        let Some(url) = &self.coordinator_url else {
+            ui.label("This computer searches on its own.");
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label("Searching together with others through");
+            ui.hyperlink(url);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Your name on the public page:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.edit.coordinator_name)
+                    .char_limit(40)
+                    .hint_text("anonymous"),
+            );
+        });
+        ui.small(
+            "Shown next to the work this computer does and anything it finds. Left empty, the page shows a random ID.",
+        );
+    }
+
     fn startup_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Startup");
         let mut wanted = self.starts_at_login;
@@ -364,6 +389,8 @@ impl eframe::App for SettingsApp {
                 self.apps_section(ui);
                 ui.separator();
                 self.thermal_section(ui);
+                ui.separator();
+                self.shared_section(ui);
                 ui.separator();
                 self.startup_section(ui);
                 ui.separator();

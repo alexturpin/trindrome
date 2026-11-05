@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use num_bigint::BigUint;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
@@ -70,7 +71,9 @@ pub struct Client {
     identity: Identity,
     worker_id: Mutex<Option<String>>,
     hardware: String,
-    name: Option<String>,
+    /// This computer's name, recorded privately by the coordinator so the
+    /// owner can find a discoverer whose display name doesn't say who they are.
+    hostname: Option<String>,
 }
 
 impl Client {
@@ -83,16 +86,10 @@ impl Client {
             agent: ureq::AgentBuilder::new().timeout(TIMEOUT).build(),
             worker_id: Mutex::new(worker_id),
             hardware: hardware.to_string(),
-            name: None,
+            hostname: hostname(),
             identity,
             url,
         })
-    }
-
-    /// The display name sent with every lease request.
-    pub fn with_name(mut self, name: Option<String>) -> Self {
-        self.name = name;
-        self
     }
 
     pub fn url(&self) -> &str {
@@ -136,6 +133,7 @@ impl Client {
             "public_key": self.identity.public_key_base64(),
             "agent_version": AGENT_VERSION,
             "gpu": self.hardware,
+            "hostname": self.hostname,
         });
         let reply = self.send("/v1/register", &body, None)?;
         if reply.status != 200 {
@@ -168,14 +166,17 @@ impl Client {
         Ok(reply)
     }
 
-    /// Asks for work, given the worker's measured rate in candidates per second.
-    pub fn acquire(&self, rate: f64) -> Result<Acquired> {
+    /// Asks for work, given the worker's measured rate in candidates per
+    /// second. `name` is the display name currently configured; sending it
+    /// every time lets a changed name show up without a restart.
+    pub fn acquire(&self, rate: f64, name: Option<&str>) -> Result<Acquired> {
         let body = json!({
             "generator_version": GENERATOR_VERSION,
             "filter_version": FILTER_VERSION,
             "max_hex_digits": MAX_HEX_DIGITS,
             "rate": rate,
-            "name": self.name,
+            "name": name,
+            "hostname": self.hostname,
         });
         let reply = self.call("/v1/leases", &body)?;
         if reply.status != 200 {
@@ -261,7 +262,7 @@ impl Client {
 
     /// Records local search as done on the coordinator (owner keys only).
     /// Returns the number of spaces it newly recorded and their candidates.
-    pub fn import_coverage(&self, spaces: &[ImportedSpace]) -> Result<(u64, String)> {
+    pub fn import_coverage(&self, spaces: &[ImportedSpace], name: Option<&str>) -> Result<(u64, String)> {
         let spaces: Vec<Value> = spaces
             .iter()
             .map(|s| {
@@ -272,7 +273,7 @@ impl Client {
                 })
             })
             .collect();
-        let body = json!({ "generator_version": GENERATOR_VERSION, "spaces": spaces, "name": self.name });
+        let body = json!({ "generator_version": GENERATOR_VERSION, "spaces": spaces, "name": name });
         let reply = self.call("/v1/import", &body)?;
         if reply.status != 200 {
             bail!("the coordinator refused the import: {}", reply.describe());
@@ -282,6 +283,36 @@ impl Client {
             reply.body["candidates"].as_str().unwrap_or("0").to_string(),
         ))
     }
+    /// Every registered worker, with private details (owner keys only).
+    pub fn workers(&self) -> Result<Vec<WorkerInfo>> {
+        let reply = self.call("/v1/workers", &json!({}))?;
+        if reply.status != 200 {
+            bail!("the coordinator refused to list workers: {}", reply.describe());
+        }
+        serde_json::from_value(reply.body["workers"].clone()).context("invalid worker list")
+    }
+}
+
+/// What the coordinator knows about a worker, for its owner.
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkerInfo {
+    pub worker_id: String,
+    pub name: Option<String>,
+    pub hostname: Option<String>,
+    pub gpu: Option<String>,
+    pub network: String,
+    pub candidates: f64,
+    pub discoveries: u64,
+    pub registered_at: i64,
+    pub last_seen: i64,
+}
+
+fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
 }
 
 /// A space whose indices `[0, searched)` were searched locally.

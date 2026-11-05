@@ -107,6 +107,12 @@ enum CoordinatorAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List every worker with its private details: computer name and network (owner keys only)
+    Workers {
+        /// Coordinator URL (default: coordinator.url from the configuration)
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -203,13 +209,39 @@ fn coordinator_command(config: &Config, action: CoordinatorAction) -> Result<Exi
             let Some(url) = url.or_else(|| config.coordinator.url.clone()) else {
                 bail!("no coordinator: pass --url or set coordinator.url");
             };
-            let client = Client::new(&url, identity_dir, "import")?.with_name(config.coordinator.name.clone());
-            let (imported, candidates) = client.import_coverage(&spaces)?;
+            let client = Client::new(&url, identity_dir, "import")?;
+            let (imported, candidates) = client.import_coverage(&spaces, config.coordinator.name.as_deref())?;
             println!(
                 "{} recorded {imported} spaces ({candidates} candidates) as searched",
                 client.url()
             );
             println!("historical lengths are ignored; spaces it already had are unchanged");
+        }
+        CoordinatorAction::Workers { url } => {
+            let Some(url) = url.or_else(|| config.coordinator.url.clone()) else {
+                bail!("no coordinator: pass --url or set coordinator.url");
+            };
+            let client = Client::new(&url, identity_dir, "owner")?;
+            let workers = client.workers()?;
+            println!(
+                "{:<24} {:<20} {:<16} {:<20} {:>10} {:>5}  last seen",
+                "worker", "name", "computer", "network", "searched", "found"
+            );
+            for w in workers {
+                println!(
+                    "{:<24} {:<20} {:<16} {:<20} {:>10} {:>5}  {} ago",
+                    w.worker_id,
+                    w.name.as_deref().unwrap_or("-"),
+                    w.hostname.as_deref().unwrap_or("-"),
+                    w.network,
+                    human(w.candidates),
+                    w.discoveries,
+                    duration(now_ms() - w.last_seen)
+                );
+                if let Some(gpu) = &w.gpu {
+                    println!("{:<24} {gpu}", "");
+                }
+            }
         }
     }
     Ok(ExitCode::SUCCESS)

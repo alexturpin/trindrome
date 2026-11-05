@@ -46,6 +46,14 @@ Then delete %LOCALAPPDATA%\Trindrome.
 
 What it sends
 -------------
-The coordinator gets: a random key created on install (no account, name or
-email), your GPU model, how fast it searches, and the results of each slice.
-Your IP address is used only for rate limiting.
+The coordinator gets: a random key created on install (no account or email),
+your GPU model, how fast it searches, and the results of each slice.
+
+It also records your computer's name (e.g. DESKTOP-1234) and your network
+(your IP address with the last part dropped), so that if this computer finds
+something the organizer can work out whose it is. Neither is ever shown
+publicly.
+
+Your name on the public page is up to you: set it in the settings window
+(right-click the tray icon), under "Shared search". Leave it empty to show a
+random ID.

@@ -5,6 +5,8 @@ import type { Coordinator } from "./coordinator";
 
 type Stats = ReturnType<Coordinator["coverage"]>;
 
+const RELEASES = "https://github.com/alexturpin/trindrome/releases/latest";
+
 const TRACKS: [string, number[]][] = [
   ["1 or 3", [0x1, 0x3]],
   ["5, 7, 9 or F", [0x5, 0x7, 0x9, 0xf]],
@@ -107,12 +109,14 @@ export function renderIndex(stats: Stats): string {
   .table { overflow-x: auto; }
   code { font-size: 13px; word-break: break-all; }
   .found { color: var(--accent); font-weight: 600; }
+  .download { display: inline-block; margin-top: 8px; padding: 8px 14px; border-radius: 6px; background: var(--accent); color: var(--bg); font-weight: 600; text-decoration: none; }
 </style>
 </head>
 <body>
 <main>
 <h1>trindrome</h1>
 <p class="muted">A shared search for numbers that are palindromes in binary, decimal and hexadecimal at the same time.</p>
+<p><a class="download" href="${RELEASES}">Download for Windows</a> <span class="muted">· needs an NVIDIA RTX 30-series or newer GPU</span></p>
 
 <div class="stats">
   <div class="stat"><b>${count(searched)}</b><span>candidates searched</span></div>
@@ -122,7 +126,7 @@ export function renderIndex(stats: Stats): string {
 </div>
 
 <h2>Progress</h2>
-<p class="muted">Lengths in hex digits. Everything here lies beyond Rick Regan's 2010 search, which covered up to 64 digits for numbers starting with 1 or 3 and 32 digits for the rest.</p>
+<p class="muted">Lengths in hex digits. Everything here lies beyond <a href="https://www.exploringbinary.com/in-search-of-decimal-binary-hexadecimal-palindromes/" style="color:inherit">Rick Regan's 2010 search</a>, which covered up to 64 digits for numbers starting with 1 or 3 and 32 digits for the rest.</p>
 <div class="table"><table>
 <tr><th>Numbers</th><th>Complete through</th><th>In progress</th></tr>
 ${trackRows(stats)}

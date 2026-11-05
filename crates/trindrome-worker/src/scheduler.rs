@@ -186,7 +186,7 @@ pub fn run(config: &Config, engines: Vec<Engine>, options: &RunOptions, interrup
     let remote = match &config.coordinator.url {
         Some(url) => {
             let identity_dir = database.parent().unwrap_or(Path::new("."));
-            let client = Client::new(url, identity_dir, &hardware)?.with_name(config.coordinator.name.clone());
+            let client = Client::new(url, identity_dir, &hardware)?;
             info!(coordinator = %client.url(), worker_id = ?client.worker_id(), "distributed mode");
             Some(client)
         }
@@ -516,7 +516,8 @@ fn remote_claim(ctx: &WorkerContext, store: &mut Store, client: &Client, engine:
     } else {
         engine.nominal_rate()
     };
-    let (message, wait) = match client.acquire(rate) {
+    let name = ctx.settings.read().unwrap().coordinator.name.clone();
+    let (message, wait) = match client.acquire(rate, name.as_deref()) {
         Ok(Acquired::Lease(grant)) => {
             if store.record_lease(&grant)? {
                 info!(chunk = %grant.chunk.id(), from = %grant.cursor, "leased a chunk from the coordinator");
