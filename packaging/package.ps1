@@ -10,7 +10,10 @@ if ($CoordinatorUrl -notmatch '^https://') { throw 'the coordinator URL must sta
 
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
 $target = Join-Path $root 'target\package'
-$log = cargo build --release --locked --target-dir $target -p trindrome-worker -p trindrome-settings 2>&1
+# Cargo reports progress on stderr, which Windows PowerShell would treat as an error.
+$ErrorActionPreference = 'Continue'
+$log = cargo build --release --locked --target-dir $target -p trindrome-worker -p trindrome-settings 2>&1 | ForEach-Object { "$_" }
+$ErrorActionPreference = 'Stop'
 $log | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 if ($log -match 'building without CUDA kernels') { throw 'nvcc was not found, so the build has no GPU kernels' }

@@ -116,7 +116,6 @@ export function renderIndex(stats: Stats): string {
 <main>
 <h1>trindrome</h1>
 <p class="muted">A shared search for numbers that are palindromes in binary, decimal and hexadecimal at the same time.</p>
-<p><a class="download" href="${RELEASES}">Download for Windows</a> <span class="muted">· needs an NVIDIA RTX 30-series or newer GPU</span></p>
 
 <div class="stats">
   <div class="stat"><b>${count(searched)}</b><span>candidates searched</span></div>
@@ -124,6 +123,10 @@ export function renderIndex(stats: Stats): string {
   <div class="stat"><b>${stats.workers_last_hour} / ${stats.workers_registered}</b><span>machines active / joined</span></div>
   <div class="stat"><b>${nontrivial.length}</b><span>new triple palindromes</span></div>
 </div>
+
+<h2>Join the search</h2>
+<p>Lend your GPU while you're away from the computer. Install it, and your machine picks up a slice of the search whenever it's idle and plugged in, stepping aside as soon as you're back.</p>
+<p><a class="download" href="${RELEASES}">Download for Windows</a> <span class="muted">· needs an NVIDIA RTX 30-series or newer GPU</span></p>
 
 <h2>Progress</h2>
 <p class="muted">Lengths in hex digits. Everything here lies beyond <a href="https://www.exploringbinary.com/in-search-of-decimal-binary-hexadecimal-palindromes/" style="color:inherit">Rick Regan's 2010 search</a>, which covered up to 64 digits for numbers starting with 1 or 3 and 32 digits for the rest.</p>
