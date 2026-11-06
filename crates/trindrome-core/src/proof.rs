@@ -104,11 +104,32 @@ pub fn segment_digest(space: SearchSpace, start: u64, end: u64, encoded: &[u8]) 
     hasher.finalize().into()
 }
 
+/// An order-independent fingerprint of a set of survivor indices: the
+/// wrapping sum of a 64-bit mix of each index. Fingerprints of disjoint ranges
+/// add up to the fingerprint of their union, so two workers that split a
+/// range into different segments can still be compared.
+///
+/// It needs no cryptographic strength: every survivor in an accepted set is
+/// re-checked, so a worker can only leave survivors out, not choose them.
+pub fn survivor_fingerprint(survivors: &[u64]) -> u64 {
+    survivors.iter().fold(0u64, |sum, &index| sum.wrapping_add(mix64(index)))
+}
+
+/// SplitMix64's finalizer.
+fn mix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 /// What a valid survivor set says about its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentCheck {
     pub survivors: u64,
     pub digest: [u8; 32],
+    /// [`survivor_fingerprint`] of the set.
+    pub fingerprint: u64,
     /// Survivors that are decimal palindromes, and so triple palindromes.
     pub matches: Vec<(u64, Verification)>,
 }
@@ -154,6 +175,7 @@ fn check_with_window(
     Ok(SegmentCheck {
         survivors: survivors.len() as u64,
         digest: segment_digest(space, start, end, encoded),
+        fingerprint: survivor_fingerprint(&survivors),
         matches,
     })
 }
@@ -198,6 +220,16 @@ mod tests {
         let check = check_with_window(space, start, end, &bytes, window).unwrap();
         assert_eq!(check.survivors, survivors.len() as u64);
         assert_eq!(check.digest, segment_digest(space, start, end, &bytes));
+        assert_eq!(check.fingerprint, survivor_fingerprint(&survivors));
+
+        // Fingerprints of a split add up to the whole; a missing survivor changes it.
+        let mid = start + (end - start) / 3;
+        let (left, right): (Vec<u64>, Vec<u64>) = survivors.iter().partition(|&&i| i < mid);
+        let halves = [(start, mid, left), (mid, end, right)].map(|(a, b, part)| {
+            check_with_window(space, a, b, &encode_survivors(a, b, &part).unwrap(), window).unwrap()
+        });
+        assert_eq!(halves[0].fingerprint.wrapping_add(halves[1].fingerprint), check.fingerprint);
+        assert_ne!(survivor_fingerprint(&survivors[1..]), check.fingerprint);
 
         // A non-survivor is rejected.
         let fake = (start..end).find(|i| !survivors.contains(i)).unwrap();

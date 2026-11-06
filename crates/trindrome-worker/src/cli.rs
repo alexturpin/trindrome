@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use serde_json::json;
@@ -113,6 +113,36 @@ enum CoordinatorAction {
         #[arg(long)]
         url: Option<String>,
     },
+    /// Set a worker's trust level (owner keys only). Results from `new`
+    /// workers are searched again by another worker before they count as checked
+    Trust {
+        /// Worker ID, as `coordinator workers` lists it, or `self` for this installation
+        worker: String,
+        level: TrustLevel,
+        /// Coordinator URL (default: coordinator.url from the configuration)
+        #[arg(long)]
+        url: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TrustLevel {
+    /// Every result is searched again by another worker
+    New,
+    /// Earned by matching replicas; results are no longer searched again
+    Established,
+    /// Your own machines: never searched again, and breaks ties
+    Trusted,
+}
+
+impl TrustLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            TrustLevel::New => "new",
+            TrustLevel::Established => "established",
+            TrustLevel::Trusted => "trusted",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -224,16 +254,20 @@ fn coordinator_command(config: &Config, action: CoordinatorAction) -> Result<Exi
             let client = Client::new(&url, identity_dir, "owner")?;
             let workers = client.workers()?;
             println!(
-                "{:<24} {:<20} {:<16} {:<20} {:>10} {:>5}  last seen",
-                "worker", "name", "computer", "network", "searched", "found"
+                "{:<24} {:<20} {:<16} {:<20} {:<16} {:>10} {:>5}  last seen",
+                "worker", "name", "computer", "network", "trust", "searched", "found"
             );
             for w in workers {
                 println!(
-                    "{:<24} {:<20} {:<16} {:<20} {:>10} {:>5}  {} ago",
+                    "{:<24} {:<20} {:<16} {:<20} {:<16} {:>10} {:>5}  {} ago",
                     w.worker_id,
                     w.name.as_deref().unwrap_or("-"),
                     w.hostname.as_deref().unwrap_or("-"),
                     w.network,
+                    match w.trust.as_str() {
+                        "new" => format!("new ({} ok)", w.matched),
+                        other => other.to_string(),
+                    },
                     human(w.candidates),
                     w.discoveries,
                     duration(now_ms() - w.last_seen)
@@ -241,6 +275,24 @@ fn coordinator_command(config: &Config, action: CoordinatorAction) -> Result<Exi
                 if let Some(gpu) = &w.gpu {
                     println!("{:<24} {gpu}", "");
                 }
+            }
+        }
+        CoordinatorAction::Trust { worker, level, url } => {
+            let Some(url) = url.or_else(|| config.coordinator.url.clone()) else {
+                bail!("no coordinator: pass --url or set coordinator.url");
+            };
+            let client = Client::new(&url, identity_dir, "owner")?;
+            let worker = if worker == "self" {
+                client
+                    .worker_id()
+                    .context("this installation hasn't registered with that coordinator yet")?
+            } else {
+                worker
+            };
+            let cancelled = client.set_trust(&worker, level.as_str())?;
+            println!("{worker} is now {}", level.as_str());
+            if cancelled > 0 {
+                println!("dropped {cancelled} queued replicas of its earlier results");
             }
         }
     }

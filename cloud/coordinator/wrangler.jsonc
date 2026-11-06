@@ -31,6 +31,8 @@
     "LEASE_TTL_SECONDS": "900",
     "REPORT_INTERVAL_SECONDS": "300",
     "REGISTRATIONS_PER_NETWORK_PER_DAY": "5",
-    "NEW_WORKERS_PER_HOUR": "100"
+    "NEW_WORKERS_PER_HOUR": "100",
+    // Segments a `new` worker must have confirmed by trusted or established replicas to become established.
+    "MATCHES_TO_ESTABLISH": "20"
   }
 }

@@ -70,7 +70,7 @@ pub fn check_survivors(
             })
         })
         .collect();
-    Ok(json!({"survivors": check.survivors, "digest": digest, "matches": matches}).to_string())
+    Ok(json!({"survivors": check.survivors, "digest": digest, "fingerprint": check.fingerprint.to_string(), "matches": matches}).to_string())
 }
 
 /// Encodes absolute survivor indices (decimal strings) of `[start, end)`; for tests.

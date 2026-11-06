@@ -15,6 +15,8 @@ export interface Versions {
 export interface SegmentCheck {
   survivors: number;
   digest: string;
+  /** survivor_fingerprint as a decimal u64: additive over disjoint ranges. */
+  fingerprint: string;
   matches: { index: string; decimal: string; hexadecimal: string; nontrivial: boolean }[];
 }
 

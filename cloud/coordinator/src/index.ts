@@ -4,7 +4,7 @@
 
 import { checkSurvivors, chunkId, versions } from "./core";
 import { renderIndex } from "./page";
-import type { Capabilities, Coordinator, WorkChunkJson } from "./coordinator";
+import type { Capabilities, Coordinator, Trust, WorkChunkJson } from "./coordinator";
 
 export { Coordinator } from "./coordinator";
 
@@ -183,7 +183,7 @@ async function register(request: Request, env: Env): Promise<Response> {
   return json(result);
 }
 
-async function acquire(env: Env, workerId: string, body: any): Promise<Response> {
+async function acquire(env: Env, workerId: string, publicKey: string, body: any): Promise<Response> {
   if (body.generator_version !== versions.generator || body.filter_version !== versions.filter) {
     throw new HttpError(
       409,
@@ -196,6 +196,7 @@ async function acquire(env: Env, workerId: string, body: any): Promise<Response>
     rate: typeof body.rate === "number" && Number.isFinite(body.rate) ? body.rate : 0,
     name: displayName(body.name),
     hostname: displayName(body.hostname),
+    owner: isOwner(env, publicKey),
   };
   const lease = await coordinator(env).acquire(workerId, caps);
   const retry = Number(env.REPORT_INTERVAL_SECONDS) || 300;
@@ -235,6 +236,7 @@ async function submitSegment(env: Env, workerId: string, leaseId: string, body: 
     end: end.toString(),
     survivors: check.survivors,
     digest: check.digest,
+    fingerprint: check.fingerprint,
     r2Key,
     backend: typeof body.backend === "string" ? body.backend.slice(0, 100) : null,
     matches: check.matches,
@@ -274,8 +276,19 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
     return json({ workers: await coordinator(env).workers() });
   }
+  if (path === "/v1/trust") {
+    if (!isOwner(env, publicKey)) {
+      throw new HttpError(403, "forbidden", "only an owner key can set trust");
+    }
+    const trust = value.trust as Trust;
+    if (typeof value.worker_id !== "string" || !["new", "established", "trusted"].includes(trust)) {
+      throw new HttpError(400, "bad_request", "worker_id and trust (new, established or trusted) are required");
+    }
+    const result = await coordinator(env).setTrust(value.worker_id, trust);
+    return json(result, result.status === "ok" ? 200 : 404);
+  }
   if (path === "/v1/leases") {
-    return acquire(env, workerId, value);
+    return acquire(env, workerId, publicKey, value);
   }
   const lease = path.match(/^\/v1\/leases\/([0-9a-f-]{36})\/(segments|renew|release)$/);
   if (!lease) {

@@ -291,6 +291,16 @@ impl Client {
         }
         serde_json::from_value(reply.body["workers"].clone()).context("invalid worker list")
     }
+
+    /// Sets a worker's trust (owner keys only); returns how many queued
+    /// replicas of its results were dropped.
+    pub fn set_trust(&self, worker_id: &str, trust: &str) -> Result<u64> {
+        let reply = self.call("/v1/trust", &json!({ "worker_id": worker_id, "trust": trust }))?;
+        if reply.status != 200 {
+            bail!("the coordinator refused to set trust: {}", reply.describe());
+        }
+        Ok(reply.body["cancelled_replicas"].as_u64().unwrap_or(0))
+    }
 }
 
 /// What the coordinator knows about a worker, for its owner.
@@ -301,6 +311,10 @@ pub struct WorkerInfo {
     pub hostname: Option<String>,
     pub gpu: Option<String>,
     pub network: String,
+    #[serde(default)]
+    pub trust: String,
+    #[serde(default)]
+    pub matched: u64,
     pub candidates: f64,
     pub discoveries: u64,
     pub registered_at: i64,

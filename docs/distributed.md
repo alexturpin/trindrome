@@ -114,7 +114,7 @@ A **replica** is a segment issued to a second worker with its range fixed. The t
 - **Match:** the segment is *confirmed*, and both workers gain credit.
 - **Mismatch:** a third, trusted worker searches it. The wrong worker drops to `new`, and **every unconfirmed segment it submitted since its last confirmed match goes back to the pool.** Cheating therefore can't keep coverage it didn't earn, however long it went undetected.
 
-Public statistics report two levels: **searched** (accepted segments) and **confirmed** (matched by an independent replica). At 3% sampling, a trusted worker that skipped work in a fraction *p* of its segments is caught after about 33/*p* segments, and everything since its last match is then redone. A failing GPU is caught the same way.
+Public statistics report two levels: **searched** (accepted segments) and **checked** (matched by an independent replica, or from a trusted or established worker). At 3% sampling, a trusted worker that skipped work in a fraction *p* of its segments is caught after about 33/*p* segments, and everything since its last match is then redone. A failing GPU is caught the same way.
 
 ## Identity and rate limiting
 
@@ -229,12 +229,12 @@ Requests are few: a few per GPU every 5 minutes. The bulk of the cost is CPU tim
 |---|---|
 | **5a. Protocol in core** | `FILTER_VERSION`, segment survivor encoding and digest, a wasm build of `trindrome-core` in CI, survivor offsets stored in the local journal. Useful locally too: it strengthens `trindrome verify`. |
 | **5b. Coordinator** | The Worker and DO with registration, rate limits, leases, segments and survivor checks. Your machines are `trusted`; no replication yet. |
-| **5c. Friends** | Replication and trust levels, voiding on mismatch, the agent's outbox hardened against flaky connections. |
+| **5c. Friends** | Replication and trust levels, voiding on mismatch, the agent's outbox hardened against flaky connections. A minimal version is built: see [How 5c is built](#how-5c-is-built). |
 | **5d. Public** | The coverage page from R2 snapshots, [public results](#public-results) anyone can check, discovery notifications, tuned limits. |
 
 ## Implementation status
 
-Built (phases 5a and 5b):
+Built (phases 5a and 5b, and a minimal 5c):
 
 - **`trindrome-core::proof`:** `FILTER_VERSION`, the survivor encoding, digest and `check_segment`.
 - **`crates/trindrome-wasm`:** the core exported to the Worker.
@@ -251,6 +251,26 @@ Built (phases 5a and 5b):
   - store schema v3 with `leases` and `segments`;
   - survivors returned by both engines.
 
+### How 5c is built
+
+- **Trust levels** are `new`, `established` and `trusted`. An owner sets them with `trindrome coordinator trust <worker|self> <level>` (`POST /v1/trust`). Marking a worker trusted or established drops the replicas still queued for its results. A worker whose key is in `OWNER_PUBLIC_KEYS` becomes trusted automatically at its next lease request.
+- **Every segment from a `new` worker queues a replica:** the same range, leased as an ordinary lease whose chunk is just that range. When the coordinator hands out work, a replica comes first. It goes to any worker except the segment's own, never to one that ever held a lease on the segment's chunk, and to a `new` worker only if it is on another network. A replica is searched by one worker from its start: if its lease is released or expires, its progress is dropped.
+- **Comparison doesn't use digests,** because the replica may checkpoint at different points. Each segment carries a **survivor fingerprint**: the wrapping sum of a 64-bit mix of every survivor index (`trindrome-core::proof::survivor_fingerprint`). Fingerprints of adjacent segments add up, so a replica's segments sum to a fingerprint and count that can be compared with the original's. Every survivor is checked when it is submitted, so a worker can only leave survivors out, never choose them. A plain checksum is therefore enough.
+- **Match:** the segment is confirmed. If the replica's worker is `trusted` or `established`, the original worker gains a match, and at `MATCHES_TO_ESTABLISH` (20) matches it becomes `established`. Its later segments are then not replicated, until 3% sampling exists. A match between two `new` workers confirms the segment but earns no trust, so two colluding keys can't promote each other.
+- **Mismatch:** if the replica came from a trusted worker, the original worker is wrong. Otherwise a **tiebreak** is queued for a trusted worker, and the side that disagrees with it is wrong.
+- **The wrong worker** drops to `new` with no matches, and every one of its `searched` (unconfirmed) segments is **voided**. Its pending replicas are cancelled, and its range goes back to the pool: the whole chunk is reopened if the segment was the whole chunk, otherwise a new chunk covers just that range. Coverage subtracts voided ranges until they are searched again. Discoveries are kept, since each one is verified on its own.
+- **Statistics:** `/v1/coverage` reports `candidates_checked` (confirmed, from trusted or established workers, or imported by an owner) and `candidates_awaiting_check`. The page shows the checked share. Replica work counts toward a contributor's total.
+- **Migration:** on the first start with 5c, every unconfirmed segment from a `new` worker gets a replica queued. Owner-key machines drop theirs on their next lease request; mark any other machines of yours `trusted` by hand.
+
+Tested end to end against `wrangler dev`, with real GPU agents and a scripted worker that reports leases as searched with no survivors:
+- a trusted worker searches every replica of a `new` worker's segments before new work; all match, and the worker becomes `established`;
+- a cheater caught by a trusted replica is demoted, its faked chunks are voided and searched again, and coverage drops by exactly those chunks;
+- a cheater caught by an `established` replica only queues tiebreaks, and the trusted tiebreak voids every unconfirmed chunk of the cheater's and cancels the other tiebreaks;
+- an `established` cheater that fakes a replica of an honest worker's segment is demoted by the tiebreak, and the honest segment is confirmed;
+- a worker is never offered a replica in a chunk it once held;
+- state written by the previous coordinator version migrates: all of its segments await a check, the owner turns trusted at its first lease request, and replicates the rest;
+- `trindrome verify` passes on every agent's database.
+
 Tested end to end against `wrangler dev`, with CPU and GPU workers on one machine:
 - registration and signed requests;
 - leasing, reporting and completing chunks, at about 6.4 billion candidates/s on the RTX 3070 Laptop;
@@ -264,7 +284,7 @@ Tested end to end against `wrangler dev`, with CPU and GPU workers on one machin
 
 Not built yet, or different from the design above:
 
-- **No replication or trust levels (phase 5c).** Every worker is `new`, and nothing is confirmed. Run only trusted machines until 5c exists.
+- **Replication is the minimal phase 5c** (see [How 5c is built](#how-5c-is-built)): no sampling of `established` or `trusted` workers, no registration-day rule, and no hardened outbox yet.
 - **No count test.** See [Checks on every submission](#checks-on-every-submission).
 - **Late uploads under a superseded lease** are accepted only if the chunk is unclaimed and they continue exactly from its cursor. Overlapping uploads are discarded rather than compared as free replicas.
 - **One lease at a time for a `new` worker.** A GPU therefore waits about a second between chunks for its last report to be accepted. That doesn't matter at 30-minute chunks, but a multi-threaded CPU worker uses only one thread.
