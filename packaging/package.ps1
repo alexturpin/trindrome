@@ -38,3 +38,4 @@ $zip = "$stage.zip"
 Remove-Item $zip -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
 Write-Host "Packaged $zip"
+Write-Host "SHA-256 $((Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower())"

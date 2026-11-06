@@ -10,7 +10,30 @@ Candidates come from Rick Regan's structure of binary/hexadecimal palindromes, s
 - **Resumable local worker** that survives crashes and kills.
 - **CUDA backend** at 6–16 billion candidates/s on an RTX 3070 Laptop GPU (per-length kernels, with batches overlapped with host work), with every survivor verified on the CPU ([docs/cuda-design.md](docs/cuda-design.md), [docs/benchmarks.md](docs/benchmarks.md)). A full replay of Regan's 2010 coverage (28.6 billion candidates) takes 19 seconds and finds no nontrivial triple palindrome.
 - **Passive Windows operation:** it computes only while you're away, pauses for games, battery power and heat, and runs as a windowless agent at login.
-- **Distributed mode (experimental, phase 5):** with `[coordinator] url` set, workers lease work from a Cloudflare Worker and Durable Object coordinator and prove each result with its filter survivor set. It is tested locally with `wrangler dev` but not deployed, and has no replication yet, so it is for machines you trust. See [docs/distributed.md](docs/distributed.md).
+- **Distributed mode (phase 5):** with `[coordinator] url` set, workers lease work from a Cloudflare Worker and Durable Object coordinator and prove each result with its filter survivor set. The shared search runs at [trindrome.alexturpin.com](https://trindrome.alexturpin.com). Results from other machines aren't replicated yet (phase 5c). See [docs/distributed.md](docs/distributed.md).
+
+## Joining the shared search
+
+The easy way is the zip on the [releases page](https://github.com/alexturpin/trindrome/releases/latest): unzip it and run `install.cmd`. Its `README.txt` says what the coordinator records. Each release lists the zip's SHA-256, so you can check your download:
+
+```powershell
+Get-FileHash trindrome-0.1.0.zip
+```
+
+The programs aren't code-signed. If you'd rather not run binaries you didn't build, build them yourself (see [Setup](#setup-windows-11)), then install as below. Your own build behaves the same as the released one.
+
+1. Put `trindrome.exe`, `trindrome-agent.exe` and `trindrome-settings.exe` from `target\release` wherever you like.
+2. Create `%LOCALAPPDATA%\Trindrome\trindrome.toml` with:
+
+   ```toml
+   [coordinator]
+   url = "https://trindrome.alexturpin.com"
+   name = "your name"   # optional; shown on the public page
+   ```
+
+3. Run `trindrome startup enable`, then start `trindrome-agent.exe` once.
+
+To build exactly what the release ships (static C runtime, the installer and the configuration in a zip), run `powershell -File packaging\package.ps1 -CoordinatorUrl https://trindrome.alexturpin.com` instead. The builds aren't reproducible, so your zip's hash won't match the release's.
 
 ## Setup (Windows 11)
 

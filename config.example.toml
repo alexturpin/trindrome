@@ -74,7 +74,8 @@ level = "info"                     # (restart)
 # Distributed mode (docs/distributed.md): the coordinator decides what to
 # search; the settings above still decide whether to run. Unset = local only.
 # url = "https://trindrome.alexturpin.com"   (restart)
-# Shown on the coordinator's public page next to your work. (restart)
+# Shown on the coordinator's public page next to your work; applies at the
+# next lease. Unset = a random ID. Never your computer's name.
 # name = "Alex's desktop"
 # A pause longer than this hands the current lease back to the coordinator.
 release_after_pause_seconds = 120
