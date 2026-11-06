@@ -201,6 +201,24 @@ Indices are canonical decimal strings, as locally. `chunks.cursor` mirrors the e
 | Fabricated survivors | The spot check rejects the submission. |
 | Many keys from one person | Registration limits per network, the global circuit breaker, and replica rules that require different networks and registration days. |
 
+## Public results
+
+The claim "nothing up to length *n*" should be checkable without trusting the organizer, the coordinator or any worker. Phase 5d publishes the evidence the coordinator already keeps.
+
+- **Snapshot:** a periodic dump to a public R2 bucket (downloads cost nothing). It holds one row per accepted segment:
+  - space and index range;
+  - status (`searched`, `confirmed` or `voided`);
+  - the worker's public ID (never its computer name or network);
+  - `FILTER_VERSION`, survivor count and digest;
+  - the path of its survivor file.
+
+  It also holds the discoveries, each with the segment it came from, and a manifest with the SHA-256 of every file.
+- **Survivor files:** the R2 objects the coordinator already stores, published as they are. At about one survivor per 10⁹ candidates, a quadrillion candidates is about a million survivors: tens of MB in all.
+- **`trindrome audit <space> <range>`:** searches any range locally and compares its survivors and digest with the snapshot. A sample over the whole snapshot is an independent spot check of the claimed coverage. This uses the same check as replication, run by anyone.
+- **An archived copy:** a frozen snapshot on Zenodo or similar, with a DOI, at milestones and with any discovery.
+
+**Imported coverage has no evidence.** `trindrome coordinator import` records the organizer's local coverage as plain ranges. Local chunks that weren't leased never kept their survivor sets, so these rows are published as `imported` with no survivor file. They rest on the organizer's word, and on anyone re-searching them with `trindrome audit`. Re-searching them under leases, at idle priority, would turn them into ordinary segments over time.
+
 ## Cost
 
 Requests are few: a few per GPU every 5 minutes. The bulk of the cost is CPU time for the exact survivor checks, which needs more than the free plan's 10 ms per request. Plan on the **$5/month Workers Paid** plan. Its included requests, Durable Object usage and R2 storage should cover a few hundred workers. Confirm with real numbers from phase 5b before inviting more people.
@@ -212,7 +230,7 @@ Requests are few: a few per GPU every 5 minutes. The bulk of the cost is CPU tim
 | **5a. Protocol in core** | `FILTER_VERSION`, segment survivor encoding and digest, a wasm build of `trindrome-core` in CI, survivor offsets stored in the local journal. Useful locally too: it strengthens `trindrome verify`. |
 | **5b. Coordinator** | The Worker and DO with registration, rate limits, leases, segments and survivor checks. Your machines are `trusted`; no replication yet. |
 | **5c. Friends** | Replication and trust levels, voiding on mismatch, the agent's outbox hardened against flaky connections. |
-| **5d. Public** | The coverage page from R2 snapshots, discovery notifications, tuned limits. |
+| **5d. Public** | The coverage page from R2 snapshots, [public results](#public-results) anyone can check, discovery notifications, tuned limits. |
 
 ## Implementation status
 
