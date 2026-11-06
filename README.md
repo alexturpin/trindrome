@@ -31,7 +31,7 @@ The programs aren't code-signed. If you'd rather not run binaries you didn't bui
    name = "your name"   # optional; shown on the public page
    ```
 
-3. Run `trindrome startup enable`, then start `trindrome-agent.exe` once.
+3. Start `trindrome-agent.exe`. Right-click its tray icon, open **Settings…**, and tick **Start at sign-in**.
 
 To build exactly what the release ships (static C runtime, the installer and the configuration in a zip), run `powershell -File packaging\package.ps1 -CoordinatorUrl https://trindrome.alexturpin.com` instead. The builds aren't reproducible, so your zip's hash won't match the release's.
 
@@ -53,11 +53,7 @@ Running needs only the NVIDIA driver. A build made without the CUDA Toolkit stil
 
 ## Running it in the background
 
-```bash
-target/release/trindrome startup enable
-```
-
-This starts `trindrome-agent.exe` at every login, with no console window and no administrator rights. It appears as "Trindrome" in Task Manager → Startup apps. Start it now by running `trindrome-agent.exe` once. It computes on the GPU only while:
+Start `trindrome-agent.exe`. It runs in the tray with no console window. To start it at every sign-in, tick **Start at sign-in** in its Settings window; it then appears as "Trindrome" in Task Manager → Startup apps, and needs no administrator rights. (`trindrome startup enable` does the same from a terminal.) It computes on the GPU only while:
 
 - the keyboard and mouse have been idle for `idle_minutes` (default 5), and the GPU was otherwise quiet;
 - no application in `exclusive_gpu_apps` is running (add your games; controllers aren't seen by idle detection);
@@ -79,6 +75,7 @@ Its tooltip says why, and its menu offers Pause/Resume, **Settings…**, Open da
 - **When to compute:** the idle period, the GPU-quiet check, plugged-in only, overnight mode.
 - **Applications to pause for:** type a name or path, or pick from running applications.
 - **GPU temperature limits.**
+- **Shared search:** the coordinator, and the name shown on its public page.
 - **Start at sign-in.**
 
 It edits `trindrome.toml` in place, keeping your comments, and the agent applies the changes within seconds.
