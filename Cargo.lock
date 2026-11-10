@@ -3371,7 +3371,7 @@ dependencies = [
 
 [[package]]
 name = "trindrome-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -3383,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "trindrome-cpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "trindrome-cuda"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc",
  "cudarc",
@@ -3403,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "trindrome-settings"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "eframe",
@@ -3412,7 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "trindrome-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "num-bigint",
  "serde_json",
@@ -3422,7 +3422,7 @@ dependencies = [
 
 [[package]]
 name = "trindrome-worker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",

@@ -79,8 +79,6 @@ export function renderIndex(stats: Stats): string {
     )
     .join("");
   const rate = stats.candidates_per_second_last_hour;
-  const checkable = stats.candidates_checked + stats.candidates_awaiting_check;
-  const checked = checkable > 0 ? `${((100 * stats.candidates_checked) / checkable).toFixed(checkable > stats.candidates_checked ? 1 : 0)}%` : "—";
 
   return `<!doctype html>
 <html lang="en">
@@ -123,10 +121,8 @@ export function renderIndex(stats: Stats): string {
   <div class="stat"><b>${count(searched)}</b><span>candidates searched</span></div>
   <div class="stat"><b>${rate > 0 ? `${count(rate)}/s` : "idle"}</b><span>over the last hour</span></div>
   <div class="stat"><b>${stats.workers_last_hour} / ${stats.workers_registered}</b><span>machines active / joined</span></div>
-  <div class="stat"><b>${checked}</b><span>checked</span></div>
   <div class="stat"><b>${nontrivial.length}</b><span>new triple palindromes</span></div>
 </div>
-<p class="muted">Every result from a new machine is searched again by a second one before it counts as checked${stats.candidates_awaiting_check > 0 ? `; ${count(stats.candidates_awaiting_check)} candidates are waiting for that` : ""}. If the two disagree, a third search settles it, and everything unchecked from the machine that was wrong is searched again.</p>
 
 <h2>Join the search</h2>
 <p>Lend your GPU while you're away from the computer. Install it, and your machine picks up a slice of the search whenever it's idle and plugged in, stepping aside as soon as you're back.</p>

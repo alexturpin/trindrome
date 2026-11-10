@@ -44,7 +44,7 @@ search_N(params, start: u64, count: u64, window: u32,
 - `counters[1]` is the number of candidates processed; each thread adds its own tally once. The host requires it to equal `count`.
 - `counters[2]` is the batch checksum (below).
 
-**Overflow:** if `counters[0] > capacity`, the batch is searched again on the CPU with the exact reference. A batch is committed only when its processed count matches, and never on a CUDA error.
+**Overflow:** if `counters[0] > capacity`, the batch is searched again on the GPU in halves, recursively, until each piece's survivors fit. Long spaces pass about 1.4 survivors per million candidates at 96 hex digits, so a 2^32 batch can overflow; the CPU reference would take most of an hour on it. A batch is committed only when its processed count matches, and never on a CUDA error.
 
 **Host checks before launch:** the space is supported, `start + count` does not overflow a `u64` or exceed the space, `count ≤ 2^32`, and `N` fits the length.
 

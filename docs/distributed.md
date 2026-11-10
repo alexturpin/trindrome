@@ -183,7 +183,7 @@ Indices are canonical decimal strings, as locally. `chunks.cursor` mirrors the e
   - a `segments` table: every checkpoint of a leased chunk with its survivor set, kept until the coordinator accepts or supersedes it.
 
   Leased chunks are ordinary `work_chunks` rows, so the checkpoint rule, crash recovery and `trindrome verify` cover them. They are left out of local allocation and of the local tiling check.
-- **Survivors from both engines.** The CUDA engine already returns each batch's survivors; on overflow the Rust reference filter recomputes them. The CPU engine runs the reference filter alongside the exact search.
+- **Survivors from both engines.** The CUDA engine already returns each batch's survivors; on overflow it searches the batch again in smaller pieces on the GPU. The CPU engine runs the reference filter alongside the exact search.
 - **Search threads lease work** when they have none, and wait (shown as a back-off) when the coordinator can't be reached or has nothing to give.
 - **A sync thread** uploads segments, renews leases and hands back paused ones. It never blocks the engine: if the coordinator can't be reached, segments wait in the database. When the worker stops, the sync thread stops after the search threads and spends up to 15 s handing everything over.
 - **Policy is unchanged.** A pause longer than `release_after_pause_seconds` (default 120) releases the lease. Shorter pauses keep it.
@@ -259,7 +259,7 @@ Built (phases 5a and 5b, and a minimal 5c):
 - **Match:** the segment is confirmed. If the replica's worker is `trusted` or `established`, the original worker gains a match, and at `MATCHES_TO_ESTABLISH` (20) matches it becomes `established`. Its later segments are then not replicated, until 3% sampling exists. A match between two `new` workers confirms the segment but earns no trust, so two colluding keys can't promote each other.
 - **Mismatch:** if the replica came from a trusted worker, the original worker is wrong. Otherwise a **tiebreak** is queued for a trusted worker, and the side that disagrees with it is wrong.
 - **The wrong worker** drops to `new` with no matches, and every one of its `searched` (unconfirmed) segments is **voided**. Its pending replicas are cancelled, and its range goes back to the pool: the whole chunk is reopened if the segment was the whole chunk, otherwise a new chunk covers just that range. Coverage subtracts voided ranges until they are searched again. Discoveries are kept, since each one is verified on its own.
-- **Statistics:** `/v1/coverage` reports `candidates_checked` (confirmed, from trusted or established workers, or imported by an owner) and `candidates_awaiting_check`. The page shows the checked share. Replica work counts toward a contributor's total.
+- **Statistics:** `/v1/coverage` reports `candidates_checked` (confirmed, from trusted or established workers, or imported by an owner) and `candidates_awaiting_check`. Replica work counts toward a contributor's total.
 - **Migration:** on the first start with 5c, every unconfirmed segment from a `new` worker gets a replica queued. Owner-key machines drop theirs on their next lease request; mark any other machines of yours `trusted` by hand.
 
 Tested end to end against `wrangler dev`, with real GPU agents and a scripted worker that reports leases as searched with no survivors:

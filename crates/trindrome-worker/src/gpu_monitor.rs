@@ -22,19 +22,24 @@ impl GpuMonitor {
         })
     }
 
-    /// Utilization and temperature are required; power draw is reported when
-    /// the GPU and driver support it.
+    /// Temperature is required; power draw is reported when the GPU and driver
+    /// support it.
+    ///
+    /// A laptop's discrete GPU powers itself down about ten seconds after its
+    /// last use. NVML then still reads its temperature but fails utilization
+    /// (and the power state) with `Unknown`. A powered-down GPU is idle, so
+    /// unreadable utilization alongside a readable temperature counts as 0%.
     pub fn read(&self) -> Result<GpuReading, String> {
         let device = self
             .nvml
             .device_by_pci_bus_id(self.pci_bus_id.as_str())
             .map_err(|e| e.to_string())?;
-        let utilization = device.utilization_rates().map_err(|e| format!("utilization: {e}"))?;
         let temperature = device
             .temperature(TemperatureSensor::Gpu)
             .map_err(|e| format!("temperature: {e}"))?;
+        let utilization = device.utilization_rates().map_or(0, |u| u.gpu);
         Ok(GpuReading {
-            utilization_percent: utilization.gpu,
+            utilization_percent: utilization,
             temperature_c: temperature,
             power_watts: device.power_usage().ok().map(|mw| mw as f32 / 1000.0),
         })

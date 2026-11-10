@@ -102,7 +102,7 @@ Each search thread owns one engine, which turns a batch `[start, end)` into CPU-
 - **CUDA engine:** one thread. It launches the filter kernel, then:
   - requires the kernel's processed count to equal the batch size;
   - rebuilds every survivor from its index and checks it exactly on the CPU;
-  - if the survivor buffer overflowed, searches the whole batch again on the CPU;
+  - if the survivor buffer overflowed, searches the batch again on the GPU in halves until each fits;
   - every `audit_every_batches` batches, recomputes a random slice on the GPU and with the Rust reference filter before committing.
 - **Short spaces on a GPU worker.** Spaces too short for the filter (about 15 hex digits or fewer, roughly 4M candidates in all) are searched inline by the CPU reference.
 

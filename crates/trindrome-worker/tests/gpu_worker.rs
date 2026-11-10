@@ -132,3 +132,42 @@ fn gpu_worker_completes_a_mixed_plan_with_audits() {
     assert!(audits >= 3 && audited >= 3 * 2000, "{audits} audits");
     assert!(store.discoveries().unwrap().is_empty());
 }
+
+/// A 2^32 batch of a long search space passes more survivors than the buffer
+/// holds; the engine must redo it on the GPU and find exactly the survivors
+/// that small batches over the same range find.
+#[test]
+fn overflowing_batches_are_redone_on_the_gpu() {
+    use trindrome_core::SearchSpace;
+    let config = Config::default();
+    let mut engine = match Engine::cuda(&config.compute) {
+        Ok(e) => e,
+        Err(e) if std::env::var_os("TRINDROME_REQUIRE_GPU").is_some() => panic!("GPU required: {e}"),
+        Err(e) => return eprintln!("skipping GPU test: {e}"),
+    };
+    let space = SearchSpace::new(96, 0x3).unwrap();
+    let start = 108_152_355_730_846u64;
+    let count = 1u64 << 32;
+    let b = |v: u64| BigUint::from(v);
+    let mut compute = config.compute.clone();
+    compute.audit_every_batches = 0;
+
+    let big = engine
+        .run_batch(space, &b(start), &b(start + count), &compute, None, true)
+        .unwrap();
+    let big = big.survivors.unwrap();
+    assert!(
+        big.len() > trindrome_cuda::DEFAULT_SURVIVOR_CAPACITY as usize,
+        "expected an overflow, found only {} survivors",
+        big.len()
+    );
+
+    let piece = count / 16;
+    let mut small = Vec::new();
+    for i in 0..16 {
+        let s = start + i * piece;
+        let out = engine.run_batch(space, &b(s), &b(s + piece), &compute, None, true).unwrap();
+        small.extend(out.survivors.unwrap());
+    }
+    assert_eq!(big, small);
+}

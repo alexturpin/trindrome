@@ -17,7 +17,7 @@ Candidates come from Rick Regan's structure of binary/hexadecimal palindromes, s
 The easy way is the zip on the [releases page](https://github.com/alexturpin/trindrome/releases/latest): unzip it and run `install.cmd`. Its `README.txt` says what the coordinator records. Each release lists the zip's SHA-256, so you can check your download:
 
 ```powershell
-Get-FileHash trindrome-0.1.0.zip
+Get-FileHash trindrome-0.1.1.zip
 ```
 
 The programs aren't code-signed. If you'd rather not run binaries you didn't build, build them yourself (see [Setup](#setup-windows-11)), then install as below. Your own build behaves the same as the released one.

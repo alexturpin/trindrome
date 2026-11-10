@@ -2,8 +2,9 @@
 //!
 //! Whatever the backend, a batch yields CPU-verified matches only: the CUDA path
 //! rebuilds every GPU survivor from its index and checks it exactly, redoes the
-//! batch on the CPU if the survivor buffer overflowed, and periodically audits a
-//! slice of the batch against the Rust reference filter before it is committed.
+//! batch on the GPU in smaller pieces if the survivor buffer overflowed, and
+//! periodically audits a slice of the batch against the Rust reference filter
+//! before it is committed.
 //!
 //! For chunks leased from a coordinator, a batch also yields its survivor set,
 //! the proof of search the coordinator checks (`trindrome_core::proof`).
@@ -323,27 +324,26 @@ impl CudaEngine {
             result.processed
         );
 
-        let survivors = match (want_survivors, result.overflowed) {
-            (false, _) => None,
-            (true, false) => Some(result.survivors.clone()),
-            (true, true) => Some(reference_survivors(space, start, end)?),
-        };
-        let matches = if result.overflowed {
-            warn!(%start, %end, "GPU survivor buffer overflowed; searching the batch exactly on the CPU");
-            search_range(space, start, end)?.matches
+        // Long search spaces pass more candidates through the filter, so a large
+        // batch can overflow the survivor buffer. Redo it on the GPU in pieces
+        // small enough to fit: the CPU would take most of an hour on one batch.
+        let all_survivors = if result.overflowed {
+            warn!(%start, %end, "GPU survivor buffer overflowed; redoing the batch on the GPU in smaller pieces");
+            self.split_survivors(&prepared, start64, count)?
         } else {
-            let mut matches = Vec::new();
-            for &index in &result.survivors {
-                let value = space.candidate(&index.into())?;
-                if is_decimal_palindrome(&value) {
-                    matches.push(Match {
-                        index: index.into(),
-                        verification: Verification::of(&value),
-                    });
-                }
-            }
-            matches
+            result.survivors
         };
+        let mut matches = Vec::new();
+        for &index in &all_survivors {
+            let value = space.candidate(&index.into())?;
+            if is_decimal_palindrome(&value) {
+                matches.push(Match {
+                    index: index.into(),
+                    verification: Verification::of(&value),
+                });
+            }
+        }
+        let survivors = want_survivors.then_some(all_survivors);
 
         self.batches += 1;
         let mut audits = Vec::new();
@@ -374,6 +374,29 @@ impl CudaEngine {
             audits,
             survivors,
         })
+    }
+
+    /// The complete, sorted survivor set of `[start, start + count)`, searched in
+    /// halves (recursively) until each half's survivors fit in the buffer.
+    fn split_survivors(&mut self, prepared: &Prepared, start: u64, count: u64) -> Result<Vec<u64>> {
+        let half = count / 2;
+        ensure!(half > 0, "a single candidate overflowed the GPU survivor buffer");
+        let mut survivors = Vec::new();
+        for (s, n) in [(start, half), (start + half, count - half)] {
+            let r = self.backend()?.search(prepared, s, n)?;
+            ensure!(
+                r.processed == n,
+                "GPU processed {} of {n} candidates in [{s}, {}); refusing to record coverage",
+                r.processed,
+                s + n
+            );
+            if r.overflowed {
+                survivors.extend(self.split_survivors(prepared, s, n)?);
+            } else {
+                survivors.extend(r.survivors);
+            }
+        }
+        Ok(survivors)
     }
 
     /// Recomputes a random slice of the batch on the GPU and with the Rust filter.
